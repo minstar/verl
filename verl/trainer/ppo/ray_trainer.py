@@ -1183,25 +1183,28 @@ class RayPPOTrainer:
             batch_td = batch.to_tensordict()
             # step 2: convert from padding to nopadding
             batch_td = left_right_2_no_padding(batch_td)
-            # step 3: add meta info
-            tu.assign_non_tensor(batch_td, calculate_entropy=True, compute_loss=False)
+            # step 3: add meta info — skip entropy if entropy_coeff=0 (saves ~24 GiB VRAM for large vocab models)
+            _need_entropy = self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+            tu.assign_non_tensor(batch_td, calculate_entropy=_need_entropy, compute_loss=False)
             output = self.actor_rollout_wg.compute_log_prob(batch_td)
             # gather output
-            entropy = tu.get(output, "entropy")
             log_probs = tu.get(output, "log_probs")
             routed_experts = tu.get(output, "routed_experts")
 
             old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
             # step 4. No padding to padding
-            entropy = no_padding_2_padding(entropy, batch_td)
             log_probs = no_padding_2_padding(log_probs, batch_td)
-            # step 5: rebuild a tensordict and convert to dataproto
-            if routed_experts is not None:
-                old_log_prob = tu.get_tensordict(
-                    {"old_log_probs": log_probs.float(), "entropys": entropy.float(), "routed_experts": routed_experts}
-                )
+            result_dict = {"old_log_probs": log_probs.float()}
+            if _need_entropy:
+                entropy = tu.get(output, "entropy")
+                entropy = no_padding_2_padding(entropy, batch_td)
+                result_dict["entropys"] = entropy.float()
             else:
-                old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
+                # Create zero entropy placeholder so downstream code doesn't break
+                result_dict["entropys"] = torch.zeros_like(log_probs, dtype=torch.float32)
+            if routed_experts is not None:
+                result_dict["routed_experts"] = routed_experts
+            old_log_prob = tu.get_tensordict(result_dict)
             old_log_prob = DataProto.from_tensordict(old_log_prob)
         else:
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
@@ -1411,10 +1414,6 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
-                    if self._should_compute_teacher_colocate(batch):
-                        with marked_timer("teacher", timing_raw, color="cyan"):
-                            batch_teacher = self._compute_teacher_colocate(batch)
-                            batch = batch.union(batch_teacher)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1442,6 +1441,12 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+
+                    # BT-OPD: compute teacher logprobs AFTER reward (needs reward for hint injection)
+                    if self._should_compute_teacher_colocate(batch):
+                        with marked_timer("teacher", timing_raw, color="cyan"):
+                            batch_teacher = self._compute_teacher_colocate(batch)
+                            batch = batch.union(batch_teacher)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1563,6 +1568,11 @@ class RayPPOTrainer:
                         # Still in critic warmup, only update weights to wake up rollout replicas.
                         self.checkpoint_manager.update_weights(self.global_steps)
                     else:
+                        # Free cached GPU memory before actor update to avoid OOM
+                        # when SGLang processes consume baseline memory on shared GPUs
+                        import gc
+                        gc.collect()
+                        torch.cuda.empty_cache()
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -351,4 +352,172 @@ def compute_distillation_loss_reverse_kl_estimator(
     metrics = {
         "distillation/abs_loss": Metric(AggregationType.MEAN, distillation_losses[response_mask_bool].abs().mean()),
     }
+    return distillation_losses, metrics
+
+
+# ── BT-OPD: Bidirectional Truncated On-Policy Distillation ──────────
+# Turn-aware truncation + bidirectional corrective gradient.
+# Config via env vars: BT_OPD_MAX_TURN (default 3), BT_OPD_BIDIRECTIONAL (default 1).
+
+_BT_OPD_MAX_TURN = int(os.environ.get("BT_OPD_MAX_TURN", "3"))
+_BT_OPD_BIDIRECTIONAL = os.environ.get("BT_OPD_BIDIRECTIONAL", "1") == "1"
+
+# Resolve <|im_start|> token ID dynamically from tokenizer to avoid hardcoding
+# model-specific values. Falls back to env var BT_OPD_IM_START_TOKEN_ID if set.
+_IM_START_TOKEN_ID: int | None = None
+
+
+def _get_im_start_token_id() -> int:
+    """Lazily resolve <|im_start|> token ID from the model's tokenizer."""
+    global _IM_START_TOKEN_ID
+    if _IM_START_TOKEN_ID is not None:
+        return _IM_START_TOKEN_ID
+
+    # Allow env var override for cases where tokenizer isn't available
+    env_val = os.environ.get("BT_OPD_IM_START_TOKEN_ID")
+    if env_val is not None:
+        _IM_START_TOKEN_ID = int(env_val)
+        return _IM_START_TOKEN_ID
+
+    # Try to resolve from the model tokenizer
+    model_path = os.environ.get("BT_OPD_MODEL_PATH", "")
+    if model_path:
+        try:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            _IM_START_TOKEN_ID = tokenizer.convert_tokens_to_ids("<|im_start|>")
+            print(f"[BT-OPD] Resolved <|im_start|> token ID = {_IM_START_TOKEN_ID} from {model_path}")
+            return _IM_START_TOKEN_ID
+        except Exception as e:
+            print(f"[BT-OPD] Warning: Failed to resolve <|im_start|> from tokenizer: {e}")
+
+    # Fallback: Qwen3.5 default
+    _IM_START_TOKEN_ID = 248045
+    print(f"[BT-OPD] Using default <|im_start|> token ID = {_IM_START_TOKEN_ID} (Qwen3.5)")
+    return _IM_START_TOKEN_ID
+
+
+def _build_turn_mask(input_ids, response_mask_bool, max_turn):
+    """Build per-token mask that is 1.0 for first `max_turn` assistant turns."""
+    if max_turn <= 0:
+        return torch.ones_like(response_mask_bool, dtype=torch.float32)
+
+    resp_indices = response_mask_bool.nonzero(as_tuple=True)[0]
+    if len(resp_indices) == 0:
+        return torch.zeros_like(response_mask_bool, dtype=torch.float32)
+
+    resp_start = resp_indices[0].item()
+    resp_end = resp_indices[-1].item() + 1
+
+    resp_ids = input_ids[resp_start:resp_end]
+    im_starts = (resp_ids == _get_im_start_token_id()).nonzero(as_tuple=True)[0]
+
+    mask = torch.zeros_like(response_mask_bool, dtype=torch.float32)
+
+    if len(im_starts) == 0:
+        if max_turn >= 1:
+            mask[resp_start:resp_end] = 1.0
+        return mask
+
+    # Turn 0: resp_start → first <|im_start|>
+    boundaries = [(resp_start, resp_start + im_starts[0].item())]
+    for i in range(len(im_starts)):
+        s = resp_start + im_starts[i].item()
+        e = (resp_start + im_starts[i + 1].item()) if i + 1 < len(im_starts) else resp_end
+        boundaries.append((s, e))
+
+    for tidx, (s, e) in enumerate(boundaries):
+        if tidx >= max_turn:
+            break
+        mask[s:e] = 1.0
+
+    return mask
+
+
+@register_distillation_loss(
+    DistillationLossSettings(names=["bt_opd_kl"], use_estimator=True)  # type: ignore[arg-type]
+)
+def compute_bt_opd_loss(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output: dict,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict]:
+    """BT-OPD: Bidirectional Truncated On-Policy Distillation loss.
+
+    Extensions over standard reverse-KL:
+      1. Truncated: OPD only on first K assistant turns (env BT_OPD_MAX_TURN).
+      2. Bidirectional: flip KL sign for negative-reward trajectories (env BT_OPD_BIDIRECTIONAL).
+    """
+    student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
+    teacher_log_probs = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
+    response_mask = data["response_mask"]
+    response_mask_bool = response_mask.bool()
+    assert teacher_log_probs.shape == student_log_probs.shape == response_mask_bool.shape
+
+    # Debug: check for NaN/inf in logprobs before fixing
+    t_nan = teacher_log_probs.isnan().sum().item()
+    t_inf = teacher_log_probs.isinf().sum().item()
+    s_nan = student_log_probs.isnan().sum().item()
+    s_inf = student_log_probs.isinf().sum().item()
+    if t_nan > 0 or t_inf > 0 or s_nan > 0 or s_inf > 0:
+        t_valid = teacher_log_probs[response_mask_bool]
+        s_valid = student_log_probs[response_mask_bool]
+        print(f"[BT-OPD] teacher NaN={t_nan} inf={t_inf} | student NaN={s_nan} inf={s_inf} | "
+              f"teacher valid: min={t_valid.min():.4f} max={t_valid.max():.4f} nan={t_valid.isnan().sum()} | "
+              f"student valid: min={s_valid.min():.4f} max={s_valid.max():.4f} nan={s_valid.isnan().sum()}")
+    # Replace NaN/inf in logprobs: NaN from first-token positions, -inf from zero-probability tokens
+    # Use -20.0 for NaN (≈ prob 2e-9), not 0.0 which means prob=1.0 and biases KL
+    teacher_log_probs = torch.nan_to_num(teacher_log_probs, nan=-20.0, posinf=0.0, neginf=-20.0)
+    student_log_probs = torch.nan_to_num(student_log_probs, nan=-20.0, posinf=0.0, neginf=-20.0)
+
+    bsz, seq_len = student_log_probs.shape
+
+    distillation_losses = kl_penalty(
+        logprob=student_log_probs, ref_logprob=teacher_log_probs, kl_penalty="kl"
+    )
+
+    max_turn = _BT_OPD_MAX_TURN
+    bidirectional = _BT_OPD_BIDIRECTIONAL
+    num_truncated = 0
+    num_negative = 0
+
+    # 1. Truncated OPD: zero out tokens after turn K
+    # Use response-only IDs (data["responses"]) not full input_ids (which is a nested tensor
+    # with prompt+response and different indexing than response_mask_bool).
+    response_ids_key = "responses" if "responses" in data else "input_ids"
+    if max_turn > 0 and response_ids_key in data:
+        for i in range(bsz):
+            resp_ids_i = data[response_ids_key][i]
+            # Debug: log turn detection for first sample of each batch
+            if i == 0:
+                valid_len = int(response_mask_bool[i].sum().item())
+                valid_ids = resp_ids_i[:valid_len]
+                im_count_valid = (valid_ids == _get_im_start_token_id()).sum().item()
+                im_count_total = (resp_ids_i == _get_im_start_token_id()).sum().item()
+                print(f"[BT-OPD Turn Debug] valid_im_start={im_count_valid} total_im_start={im_count_total} "
+                      f"valid_len={valid_len} shape={resp_ids_i.shape}")
+            tmask = _build_turn_mask(resp_ids_i, response_mask_bool[i], max_turn)
+            before = response_mask_bool[i].sum().item()
+            after = (response_mask_bool[i] & tmask.bool()).sum().item()
+            num_truncated += before - after
+            distillation_losses[i] = distillation_losses[i] * tmask.to(distillation_losses.device)
+
+    # 2. Bidirectional OPD: flip KL for negative-advantage trajectories
+    if bidirectional and "advantages" in data:
+        for i in range(bsz):
+            valid_adv = data["advantages"][i][response_mask_bool[i]]
+            if len(valid_adv) > 0 and valid_adv[0].item() < 0:
+                distillation_losses[i] = -distillation_losses[i]
+                num_negative += 1
+
+    valid = distillation_losses[response_mask_bool]
+    metrics = {
+        "bt_opd/kl_abs_mean": Metric(AggregationType.MEAN, valid.abs().mean()),
+        "bt_opd/max_turn": float(max_turn),
+        "bt_opd/bidirectional": float(bidirectional),
+        "bt_opd/negative_trajs": float(num_negative),
+        "bt_opd/truncated_tokens": float(num_truncated),
+    }
+
     return distillation_losses, metrics
