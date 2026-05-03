@@ -106,7 +106,20 @@ class ToolAgentLoop(AgentLoopBase):
         tool_config_path = self.rollout_config.multi_turn.tool_config_path
         tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
         self.tools = {tool.name: tool for tool in tool_list}
-        self.tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list]
+        # inject_tool_schemas controls whether full schemas are passed to apply_chat_template.
+        # When False, tools are already embedded in data system messages (per-domain).
+        # However, some chat templates (e.g., Qwen3.5) only add tool-call instructions when
+        # tools is non-empty. Pass a minimal placeholder so the template includes tool instructions
+        # without duplicating all schemas.
+        inject_schemas = getattr(self.rollout_config.multi_turn, "inject_tool_schemas", True)
+        all_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list]
+        if inject_schemas:
+            self.tool_schemas = all_schemas
+        elif all_schemas:
+            # Pass single placeholder tool to trigger tool-call instructions in chat template
+            self.tool_schemas = [all_schemas[0]]
+        else:
+            self.tool_schemas = []
         self.tool_parser = ToolParser.get_tool_parser(self.rollout_config.multi_turn.format, self.tokenizer)
         self.tool_parser_name = self.rollout_config.multi_turn.format
 
@@ -122,6 +135,21 @@ class ToolAgentLoop(AgentLoopBase):
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+        # Inject stop token IDs so SGLang stops at tool call boundaries,
+        # enabling actual multi-turn tool execution instead of generating
+        # the entire response budget in a single pass.
+        # NOTE: Must use stop_token_ids (not stop strings) because veRL runs SGLang
+        # with skip_tokenizer_init=True — string-based stop checking would crash.
+        stop_token_str = getattr(self.tool_parser, "tool_call_end_token", None)
+        if stop_token_str:
+            stop_token_ids = self.tokenizer.encode(stop_token_str, add_special_tokens=False)
+            existing_stop_ids = sampling_params.get("stop_token_ids", [])
+            if not all(tid in existing_stop_ids for tid in stop_token_ids):
+                sampling_params = {
+                    **sampling_params,
+                    "stop_token_ids": existing_stop_ids + stop_token_ids,
+                }
+
         messages = list(kwargs["raw_prompt"])
 
         # extract images and videos from messages
@@ -379,6 +407,11 @@ class ToolAgentLoop(AgentLoopBase):
         if agent_data.response_logprobs:
             agent_data.response_logprobs += [0.0] * len(response_ids)
         agent_data.user_turns += 1
+
+        # Terminate immediately after submit_answer tool call
+        if any(name == "submit_answer" for name in tool_call_names):
+            return AgentState.TERMINATED
+
         return AgentState.GENERATING
 
     async def _handle_interacting_state(self, agent_data: AgentData) -> AgentState:

@@ -203,6 +203,19 @@ def distillation_ppo_loss(
 
     # Called as final policy loss
     distillation_loss_config = distillation_config.distillation_loss
+
+    # RLAD mode: unified loss that replaces both policy + distillation
+    if distillation_loss_config.loss_mode == "rlad":
+        rlad_loss_fn = get_distillation_loss_fn("rlad")
+        rlad_loss, rlad_metrics = rlad_loss_fn(
+            config=config,
+            distillation_config=distillation_config,
+            model_output=model_output,
+            data=data,
+        )
+        # RLAD returns the full unified loss — no separate policy loss needed
+        return rlad_loss, rlad_metrics
+
     distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
     policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
     if not distillation_loss_config.use_task_rewards:
@@ -362,6 +375,12 @@ def compute_distillation_loss_reverse_kl_estimator(
 _BT_OPD_MAX_TURN = int(os.environ.get("BT_OPD_MAX_TURN", "3"))
 _BT_OPD_BIDIRECTIONAL = os.environ.get("BT_OPD_BIDIRECTIONAL", "1") == "1"
 
+# Top-K position filtering (EMA-PG inspired, arXiv:2602.04417):
+# Only distill on positions where teacher is confident (high logprob).
+# Filters out tail positions where student-teacher gap is large → prevents divergence.
+# BT_OPD_TOPK_RATIO=1.0 (default) = no filtering; 0.5 = keep top 50% positions by teacher confidence.
+_BT_OPD_TOPK_RATIO = float(os.environ.get("BT_OPD_TOPK_RATIO", "1.0"))
+
 # Resolve <|im_start|> token ID dynamically from tokenizer to avoid hardcoding
 # model-specific values. Falls back to env var BT_OPD_IM_START_TOKEN_ID if set.
 _IM_START_TOKEN_ID: int | None = None
@@ -511,6 +530,30 @@ def compute_bt_opd_loss(
                 distillation_losses[i] = -distillation_losses[i]
                 num_negative += 1
 
+    # 3. Top-K position filtering: only distill on positions where teacher is confident
+    topk_ratio = _BT_OPD_TOPK_RATIO
+    num_topk_filtered = 0
+    if topk_ratio < 1.0:
+        for i in range(bsz):
+            valid_mask = response_mask_bool[i]
+            valid_positions = valid_mask.nonzero(as_tuple=True)[0]
+            n_valid = len(valid_positions)
+            if n_valid == 0:
+                continue
+            # Get teacher confidence at each valid position
+            teacher_conf = teacher_log_probs[i, valid_positions]
+            # Keep top-k% positions by teacher log prob (higher = more confident)
+            k = max(1, int(n_valid * topk_ratio))
+            _, topk_indices = torch.topk(teacher_conf, k, largest=True)
+            # Build mask: zero out filtered positions
+            topk_mask = torch.zeros(n_valid, device=distillation_losses.device)
+            topk_mask[topk_indices] = 1.0
+            # Apply: zero out distillation loss at low-confidence positions
+            full_topk_mask = torch.zeros_like(distillation_losses[i])
+            full_topk_mask[valid_positions] = topk_mask
+            distillation_losses[i] = distillation_losses[i] * full_topk_mask
+            num_topk_filtered += n_valid - k
+
     valid = distillation_losses[response_mask_bool]
     metrics = {
         "bt_opd/kl_abs_mean": Metric(AggregationType.MEAN, valid.abs().mean()),
@@ -518,6 +561,120 @@ def compute_bt_opd_loss(
         "bt_opd/bidirectional": float(bidirectional),
         "bt_opd/negative_trajs": float(num_negative),
         "bt_opd/truncated_tokens": float(num_truncated),
+        "bt_opd/topk_ratio": topk_ratio,
+        "bt_opd/topk_filtered": float(num_topk_filtered),
     }
 
     return distillation_losses, metrics
+
+
+# ── RLAD: Reinforcement-Aware Knowledge Distillation ────────────────
+# arXiv:2602.22495 — Trust Region Ratio Distillation (TRRD)
+# Unifies policy gradient and distillation into a single importance ratio:
+#   log r_TRRD = α·(log π_s - log π_s_old) + (1-α)·(log π_s - log π_T)
+# No separate distillation loss or distill_coef needed.
+_RLAD_ALPHA = float(os.environ.get("RLAD_ALPHA", "0.5"))
+
+
+@register_distillation_loss(
+    DistillationLossSettings(names=["rlad"], use_estimator=True)  # type: ignore[arg-type]
+)
+def compute_rlad_loss(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output: dict,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict]:
+    """RLAD: Unified TRRD ratio that replaces separate policy + distillation losses.
+
+    Instead of: policy_loss + distill_coef * distill_loss
+    RLAD uses:  clipped_surrogate_loss(r_TRRD, advantages)
+
+    where r_TRRD = exp(α·log(π_s/π_s_old) + (1-α)·log(π_s/π_T))
+
+    The advantage signal automatically gates teacher influence:
+    - Positive advantage: teacher reinforces good actions
+    - Negative advantage: teacher protects against aggressive unlearning
+    - Zero advantage: teacher has no influence
+
+    Returns the full unified loss (not just distillation part).
+    distillation_ppo_loss() must skip separate policy_loss when using this mode.
+    """
+    import verl.utils.torch_functional as verl_F
+
+    alpha = _RLAD_ALPHA
+
+    # Get logprobs
+    student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
+    teacher_log_probs = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
+    old_log_probs = data["old_log_probs"]
+    response_mask = data["response_mask"]
+    response_mask_bool = response_mask.bool()
+    advantages = data["advantages"]
+
+    assert teacher_log_probs.shape == student_log_probs.shape == response_mask_bool.shape
+
+    # Sanitize teacher logprobs (NaN from first-token, -inf from zero-prob tokens)
+    t_nan = teacher_log_probs.isnan().sum().item()
+    t_inf = teacher_log_probs.isinf().sum().item()
+    if t_nan > 0 or t_inf > 0:
+        print(f"[RLAD] teacher NaN={t_nan} inf={t_inf}")
+    teacher_log_probs = torch.nan_to_num(teacher_log_probs, nan=-20.0, posinf=0.0, neginf=-20.0)
+    student_log_probs = torch.nan_to_num(student_log_probs, nan=-20.0, posinf=0.0, neginf=-20.0)
+
+    # TRRD ratio (Eq. 5 from paper):
+    # log r_TRRD = α·(log π_s - log π_s_old) + (1-α)·(log π_s - log π_T)
+    log_ratio_grpo = student_log_probs - old_log_probs    # standard GRPO ratio
+    log_ratio_teacher = student_log_probs - teacher_log_probs  # student-to-teacher ratio
+
+    log_ratio_trrd = alpha * log_ratio_grpo + (1.0 - alpha) * log_ratio_teacher
+
+    # Clamp for numerical stability
+    log_ratio_trrd = torch.clamp(log_ratio_trrd, min=-20.0, max=20.0)
+    ratio_trrd = torch.exp(log_ratio_trrd)
+
+    # PPO clipping on TRRD ratio (same as vanilla GRPO, using config clip_ratio)
+    clip_ratio = config.clip_ratio
+    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
+    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
+
+    pg_losses1 = -advantages * ratio_trrd
+    pg_losses2 = -advantages * torch.clamp(
+        ratio_trrd, 1 - clip_ratio_low, 1 + clip_ratio_high
+    )
+    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
+
+    # Dual-clip PPO for negative advantages
+    clip_ratio_c = config.get("clip_ratio_c", 3.0) if hasattr(config, 'get') else 3.0
+    pg_losses3 = -advantages * clip_ratio_c
+    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+
+    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+
+    # Aggregate
+    loss_agg_mode = config.loss_agg_mode
+    rlad_loss = agg_loss(
+        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode,
+        **config.global_batch_info,
+    )
+
+    # Metrics
+    pg_clipfrac = verl_F.masked_mean(
+        torch.gt(pg_losses2, pg_losses1).float(), response_mask
+    )
+    ppo_kl_grpo = verl_F.masked_mean(-log_ratio_grpo, response_mask)
+    ppo_kl_teacher = verl_F.masked_mean(log_ratio_teacher, response_mask)
+    ppo_kl_trrd = verl_F.masked_mean(-log_ratio_trrd, response_mask)
+
+    metrics = {
+        "rlad/alpha": alpha,
+        "rlad/kl_grpo": Metric(AggregationType.MEAN, ppo_kl_grpo.detach()),
+        "rlad/kl_teacher": Metric(AggregationType.MEAN, ppo_kl_teacher.detach()),
+        "rlad/kl_trrd": Metric(AggregationType.MEAN, ppo_kl_trrd.detach()),
+        "rlad/pg_clipfrac": Metric(AggregationType.MEAN, pg_clipfrac.detach()),
+        "rlad/ratio_mean": Metric(AggregationType.MEAN, verl_F.masked_mean(ratio_trrd, response_mask).detach()),
+    }
+
+    # Return rlad_loss as "distillation_losses" — but it's already the full unified loss.
+    # distillation_ppo_loss() will detect rlad mode and skip separate policy loss.
+    return rlad_loss, metrics
