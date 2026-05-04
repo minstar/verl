@@ -303,26 +303,44 @@ def compute_grpo_outcome_advantage(
     """
     scores = token_level_rewards.sum(dim=-1)
 
+    # Degenerate exclusion: responses with sentinel reward (-999.0) are excluded
+    # from mean/std computation and get zero advantage (no gradient contribution).
+    import os
+    _DEGENERATE_SENTINEL = float(os.environ.get("DEGENERATE_SENTINEL", "-999.0"))
+    _SENTINEL_THRESHOLD = _DEGENERATE_SENTINEL + 1.0  # scores below this are sentinel
+
     id2score = defaultdict(list)
     id2mean = {}
     id2std = {}
 
     with torch.no_grad():
         bsz = scores.shape[0]
+        # Track which samples are degenerate (sentinel)
+        is_degenerate = scores < _SENTINEL_THRESHOLD
+
         for i in range(bsz):
-            id2score[index[i]].append(scores[i])
-        for idx in id2score:
-            if len(id2score[idx]) == 1:
+            if not is_degenerate[i]:
+                id2score[index[i]].append(scores[i])
+            # else: skip degenerate from group stats
+
+        # For groups with no valid samples, use defaults
+        unique_indices = set(index)
+        for idx in unique_indices:
+            if idx not in id2score or len(id2score[idx]) == 0:
                 id2mean[idx] = torch.tensor(0.0)
                 id2std[idx] = torch.tensor(1.0)
-            elif len(id2score[idx]) > 1:
+            elif len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0)
+                id2std[idx] = torch.tensor(1.0)
+            else:
                 scores_tensor = torch.stack(id2score[idx])
                 id2mean[idx] = torch.mean(scores_tensor)
                 id2std[idx] = torch.std(scores_tensor)
-            else:
-                raise ValueError(f"no score in prompt index: {idx}")
+
         for i in range(bsz):
-            if norm_adv_by_std_in_grpo:
+            if is_degenerate[i]:
+                scores[i] = 0.0  # Zero advantage = no gradient
+            elif norm_adv_by_std_in_grpo:
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
