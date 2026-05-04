@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from enum import Enum
 from typing import Any, Optional
 from uuid import uuid4
@@ -297,6 +298,15 @@ class ToolAgentLoop(AgentLoopBase):
             )
             add_messages.append({"role": "assistant", "content": assistant_message})
             agent_data.messages.extend(add_messages)
+
+        # Answer-pattern termination: if assistant says "Answer: ..." followed by
+        # a newline (indicating answer is complete), terminate immediately.
+        # Works regardless of tool_calls — catches both tool and non-tool turns.
+        assistant_text = await self.loop.run_in_executor(
+            None, lambda: self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
+        ) if not self.interaction_config_file else assistant_message
+        if re.search(r'(?:^|\n)\s*(?:\*\*)?Answer:\s*\S+.*\n', assistant_text, re.MULTILINE):
+            return AgentState.TERMINATED
 
         # Determine next state
         if agent_data.tool_calls:
