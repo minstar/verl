@@ -486,6 +486,178 @@ class RayPPOTrainer:
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
+    def _log_sample_responses(self, batch: DataProto, reward_extra_infos_dict: dict, phase: str = "train"):
+        """Log 3 sample responses to wandb Table for debugging student/teacher behavior.
+
+        Logs per-sample: question, student response, ground truth, reward, num_turns.
+        For training steps with teacher data, also logs teacher KL divergence per sample.
+
+        Args:
+            batch: DataProto with prompts, responses, rm_scores, and optionally teacher data
+            reward_extra_infos_dict: Dict with per-sample reward info (acc, etc.)
+            phase: "train" or "val" prefix for wandb key
+        """
+        if "wandb" not in self.config.trainer.logger:
+            return
+
+        try:
+            import wandb
+            if wandb.run is None:
+                return
+
+            n_samples = min(3, len(batch))
+            rng = np.random.RandomState(self.global_steps)
+            indices = rng.choice(len(batch), size=n_samples, replace=False)
+
+            rows = []
+            for idx in indices:
+                # Decode prompt (question)
+                prompt_ids = batch.batch["prompts"][idx]
+                prompt_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
+                # Truncate long prompts for readability
+                if len(prompt_text) > 2000:
+                    prompt_text = prompt_text[:1000] + "\n...[truncated]...\n" + prompt_text[-500:]
+
+                # Decode student response
+                response_ids = batch.batch["responses"][idx]
+                response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+                if len(response_text) > 3000:
+                    response_text = response_text[:1500] + "\n...[truncated]...\n" + response_text[-1000:]
+
+                # Reward
+                if "rm_scores" in batch.batch:
+                    reward = float(batch.batch["rm_scores"][idx].sum().item())
+                else:
+                    reward = None
+
+                # Ground truth
+                gt = None
+                try:
+                    rm_data = batch.non_tensor_batch.get("reward_model", None)
+                    if rm_data is not None and isinstance(rm_data, np.ndarray) and idx < len(rm_data):
+                        gt = rm_data[idx].get("ground_truth", None) if isinstance(rm_data[idx], dict) else None
+                    elif isinstance(rm_data, list) and idx < len(rm_data):
+                        gt = rm_data[idx].get("ground_truth", None) if isinstance(rm_data[idx], dict) else None
+                except Exception:
+                    gt = None
+
+                # Num turns
+                num_turns = None
+                if "__num_turns__" in batch.non_tensor_batch:
+                    num_turns = int(batch.non_tensor_batch["__num_turns__"][idx])
+
+                # Teacher KL (if teacher logprobs available)
+                # Use rollout_log_probs (available after generation) since old_log_probs may not be computed yet
+                teacher_kl = None
+                if "teacher_logprobs" in batch.batch:
+                    student_lp_key = "old_log_probs" if "old_log_probs" in batch.batch else "rollout_log_probs"
+                    if student_lp_key in batch.batch:
+                        resp_mask = batch.batch["response_mask"][idx]
+                        t_lp = batch.batch["teacher_logprobs"][idx]
+                        s_lp = batch.batch[student_lp_key][idx]
+                        valid = resp_mask.bool()
+                        if valid.any():
+                            teacher_kl = float((t_lp[valid] - s_lp[valid]).abs().mean().item())
+
+                rows.append({
+                    "step": self.global_steps,
+                    "sample_idx": int(idx),
+                    "question": prompt_text,
+                    "student_response": response_text,
+                    "ground_truth": str(gt) if gt is not None else "",
+                    "reward": reward,
+                    "num_turns": num_turns,
+                    "teacher_kl": teacher_kl,
+                })
+
+            table = wandb.Table(
+                columns=["step", "sample_idx", "question", "student_response",
+                         "ground_truth", "reward", "num_turns", "teacher_kl"],
+                data=[[r["step"], r["sample_idx"], r["question"], r["student_response"],
+                       r["ground_truth"], r["reward"], r["num_turns"], r["teacher_kl"]]
+                      for r in rows]
+            )
+            wandb.log({f"{phase}/sample_responses": table}, step=self.global_steps)
+
+            # Also print a summary to console for quick debugging
+            for r in rows:
+                reward_str = f"{r['reward']:.3f}" if r['reward'] is not None else "N/A"
+                turns_str = str(r['num_turns']) if r['num_turns'] is not None else "N/A"
+                kl_str = f"{r['teacher_kl']:.4f}" if r['teacher_kl'] is not None else "N/A"
+                resp_preview = r['student_response'][:200].replace('\n', ' ')
+                print(f"[Sample Log] step={r['step']} idx={r['sample_idx']} "
+                      f"reward={reward_str} turns={turns_str} teacher_kl={kl_str} "
+                      f"gt={r['ground_truth'][:50] if r['ground_truth'] else 'N/A'} "
+                      f"response={resp_preview}...")
+
+        except Exception as e:
+            print(f"[Sample Log] Failed to log samples: {e}")
+
+    def _log_val_sample_details(self, inputs, outputs, gts, scores, turns):
+        """Log 3 validation sample details to wandb Table.
+
+        Uses already-decoded text from the validation loop.
+        """
+        if "wandb" not in self.config.trainer.logger:
+            return
+
+        try:
+            import wandb
+            if wandb.run is None:
+                return
+
+            n_total = len(inputs)
+            if n_total == 0:
+                return
+
+            n_samples = min(3, n_total)
+            rng = np.random.RandomState(self.global_steps)
+            indices = rng.choice(n_total, size=n_samples, replace=False)
+
+            # Flatten turns if nested
+            flat_turns = []
+            if turns:
+                for t in turns:
+                    if hasattr(t, '__iter__'):
+                        flat_turns.extend(t)
+                    else:
+                        flat_turns.append(t)
+
+            rows = []
+            for idx in indices:
+                question = inputs[idx]
+                if len(question) > 2000:
+                    question = question[:1000] + "\n...[truncated]...\n" + question[-500:]
+                response = outputs[idx]
+                if len(response) > 3000:
+                    response = response[:1500] + "\n...[truncated]...\n" + response[-1000:]
+
+                gt = str(gts[idx]) if idx < len(gts) and gts[idx] is not None else ""
+                score = scores[idx] if idx < len(scores) else None
+                n_turns = int(flat_turns[idx]) if idx < len(flat_turns) else None
+
+                rows.append([self.global_steps, int(idx), question, response, gt, score, n_turns])
+
+            table = wandb.Table(
+                columns=["step", "sample_idx", "question", "student_response",
+                         "ground_truth", "reward", "num_turns"],
+                data=rows,
+            )
+            wandb.log({"val/sample_responses": table}, step=self.global_steps)
+
+            # Console summary
+            for row in rows:
+                score_str = f"{row[5]:.3f}" if row[5] is not None else "N/A"
+                turns_str = str(row[6]) if row[6] is not None else "N/A"
+                resp_preview = row[3][:200].replace('\n', ' ')
+                print(f"[Val Sample] step={row[0]} idx={row[1]} "
+                      f"reward={score_str} turns={turns_str} "
+                      f"gt={row[4][:50] if row[4] else 'N/A'} "
+                      f"response={resp_preview}...")
+
+        except Exception as e:
+            print(f"[Val Sample Log] Failed to log: {e}")
+
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
 
@@ -619,6 +791,15 @@ class RayPPOTrainer:
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+
+        # Log detailed val sample responses to wandb Table (3 samples)
+        self._log_val_sample_details(
+            inputs=sample_inputs,
+            outputs=sample_outputs,
+            gts=sample_gts,
+            scores=sample_scores,
+            turns=sample_turns,
+        )
 
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
@@ -887,6 +1068,15 @@ class RayPPOTrainer:
 
         # sleep all replicas to load checkpoint
         self.checkpoint_manager.sleep_replicas()
+
+    def _get_latest_checkpoint_path(self):
+        """Get the path to the latest saved checkpoint's actor directory."""
+        ckpt_dir = os.path.join(
+            self.config.trainer.default_local_dir, f"global_step_{self.global_steps}", "actor"
+        )
+        if os.path.exists(ckpt_dir):
+            return ckpt_dir
+        return None
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -1331,6 +1521,8 @@ class RayPPOTrainer:
         self.global_steps += 1
         last_val_metrics = None
         self.max_steps_duration = 0
+        self._best_val_acc = 0.0
+        self._last_val_acc = None  # None means no val yet — allow teacher updates during warmup
 
         prev_step_profile = False
         curr_step_profile = (
@@ -1447,6 +1639,10 @@ class RayPPOTrainer:
                         with marked_timer("teacher", timing_raw, color="cyan"):
                             batch_teacher = self._compute_teacher_colocate(batch)
                             batch = batch.union(batch_teacher)
+
+                    # Log sample responses every test_freq steps for debugging
+                    if self.config.trainer.test_freq > 0 and self.global_steps % self.config.trainer.test_freq == 0:
+                        self._log_sample_responses(batch, reward_extra_infos_dict, phase="train")
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1603,6 +1799,64 @@ class RayPPOTrainer:
                         with marked_timer("update_weights", timing_raw, color="red"):
                             self.checkpoint_manager.update_weights(self.global_steps)
 
+                        # Self-distillation: update teacher with student's current weights
+                        # Supports two modes: hard-copy (original) and EMA blending (new)
+                        if (
+                            self.distillation_config is not None
+                            and getattr(self.distillation_config, 'self_distillation', False)
+                            and self.teacher_model_manager is not None
+                        ):
+                            use_ema = getattr(self.distillation_config, 'use_ema', False)
+                            update_interval = (
+                                getattr(self.distillation_config, 'ema_update_interval', 1)
+                                if use_ema
+                                else self.distillation_config.teacher_update_interval
+                            )
+
+                            # Conditional teacher update: only update if val_acc improved
+                            import os as _os
+                            _conditional_update = _os.environ.get("CONDITIONAL_TEACHER_UPDATE", "") == "1"
+                            _should_update = True
+                            if _conditional_update and self.global_steps % update_interval == 0:
+                                if self._last_val_acc is None:
+                                    # No val yet (warmup) — allow updates
+                                    _should_update = True
+                                elif self._last_val_acc >= self._best_val_acc:
+                                    # Val improved or matched — allow update
+                                    _should_update = True
+                                else:
+                                    # Val declined — skip teacher update to prevent corruption
+                                    _should_update = False
+                                    print(f"[Conditional-EMA] SKIPPED teacher update at step {self.global_steps}: "
+                                          f"val_acc {self._last_val_acc:.4f} < best {self._best_val_acc:.4f}")
+
+                            if self.global_steps % update_interval == 0 and _should_update:
+                                with marked_timer("update_teacher", timing_raw):
+                                    ckpt_path = self._get_latest_checkpoint_path()
+                                    if ckpt_path is None:
+                                        # No checkpoint at this step — save one for EMA/teacher update
+                                        print(f"[Self-Distill] No checkpoint at step {self.global_steps}, "
+                                              f"saving temporary checkpoint for teacher update...")
+                                        self._save_checkpoint()
+                                        ckpt_path = self._get_latest_checkpoint_path()
+                                    if ckpt_path is not None:
+                                        if use_ema:
+                                            ema_decay = getattr(self.distillation_config, 'ema_decay', 0.995)
+                                            ema_dir = os.path.join(
+                                                os.path.dirname(os.path.dirname(ckpt_path)),
+                                                "ema_teacher_weights"
+                                            )
+                                            self.teacher_model_manager.update_teacher_ema(
+                                                ckpt_path, ema_dir, decay=ema_decay
+                                            )
+                                            print(f"[EMA] Updated teacher at step {self.global_steps} "
+                                                  f"(decay={ema_decay}) from {ckpt_path}")
+                                        else:
+                                            self.teacher_model_manager.update_teacher_from_checkpoint(ckpt_path)
+                                            print(f"[Self-Distill] Updated teacher at step {self.global_steps} from {ckpt_path}")
+                                    else:
+                                        print(f"[Self-Distill] Failed to save checkpoint at step {self.global_steps}, skipping teacher update")
+
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
@@ -1620,6 +1874,15 @@ class RayPPOTrainer:
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
+                    # Track val_acc for conditional teacher update
+                    _val_acc_key = next(
+                        (k for k in val_metrics if "acc/mean" in k), None
+                    )
+                    if _val_acc_key is not None:
+                        self._last_val_acc = val_metrics[_val_acc_key]
+                        if self._last_val_acc > self._best_val_acc:
+                            self._best_val_acc = self._last_val_acc
+                            print(f"[Val] New best val_acc: {self._best_val_acc:.4f} at step {self.global_steps}")
 
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (

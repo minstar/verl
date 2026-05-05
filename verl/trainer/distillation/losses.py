@@ -226,6 +226,28 @@ def distillation_ppo_loss(
     distillation_loss_coef = (
         distillation_loss_config.distillation_loss_coef if distillation_loss_config.use_task_rewards else 1.0
     )
+
+    # Adaptive distill coef decay based on kl_abs_mean
+    import os as _os
+    if _os.environ.get("ADAPTIVE_DISTILL_COEF", "") == "1":
+        _kl_off = float(_os.environ.get("ADAPTIVE_DISTILL_KL_OFF", "0.7"))
+        _kl_decay_start = float(_os.environ.get("ADAPTIVE_DISTILL_KL_DECAY_START", "0.3"))
+        _kl_metric = distill_metrics.get("bt_opd/kl_abs_mean")
+        if _kl_metric is not None and len(_kl_metric.values) > 0:
+            import torch as _torch
+            _raw = _kl_metric.values[0]
+            _kl_val = _raw.item() if isinstance(_raw, _torch.Tensor) else float(_raw)
+            if _kl_val >= _kl_off:
+                # kl too high — disable distillation entirely
+                distillation_loss_coef = 0.0
+                print(f"[Adaptive-Distill] OFF: kl_abs_mean={_kl_val:.4f} >= {_kl_off}")
+            elif _kl_val > _kl_decay_start:
+                # Linear decay: coef * (kl_off - kl) / (kl_off - kl_decay_start)
+                _scale = (_kl_off - _kl_val) / (_kl_off - _kl_decay_start)
+                distillation_loss_coef = distillation_loss_coef * _scale
+                print(f"[Adaptive-Distill] DECAY: kl={_kl_val:.4f}, scale={_scale:.3f}, coef={distillation_loss_coef:.3f}")
+            policy_metrics["distillation/adaptive_coef"] = Metric(AggregationType.MEAN, distillation_loss_coef)
+
     policy_loss += distill_loss * distillation_loss_coef
     policy_metrics["distillation/loss"] = Metric(value=distill_loss, aggregation=AggregationType.SUM)
 
