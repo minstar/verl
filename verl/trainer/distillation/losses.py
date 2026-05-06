@@ -237,10 +237,11 @@ def distillation_ppo_loss(
             import torch as _torch
             _raw = _kl_metric.values[0]
             _kl_val = _raw.item() if isinstance(_raw, _torch.Tensor) else float(_raw)
+            _coef_floor = float(_os.environ.get("ADAPTIVE_DISTILL_COEF_FLOOR", "0.0"))
             if _kl_val >= _kl_off:
-                # kl too high — disable distillation entirely
-                distillation_loss_coef = 0.0
-                print(f"[Adaptive-Distill] OFF: kl_abs_mean={_kl_val:.4f} >= {_kl_off}")
+                # kl too high — reduce to floor (0.0 = fully off, >0 = maintain minimum connection)
+                distillation_loss_coef = _coef_floor
+                print(f"[Adaptive-Distill] OFF→floor={_coef_floor:.2f}: kl_abs_mean={_kl_val:.4f} >= {_kl_off}")
             elif _kl_val > _kl_decay_start:
                 # Linear decay: coef * (kl_off - kl) / (kl_off - kl_decay_start)
                 _scale = (_kl_off - _kl_val) / (_kl_off - _kl_decay_start)
