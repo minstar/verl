@@ -148,6 +148,19 @@ class DistillationConfig(BaseConfig):
         Configuration for the teacher model used for distillation.
     distillation_loss (DistillationLossConfig):
         Configuration for distillation loss settings.
+    self_distillation (bool):
+        Refresh the teacher from the student during training, instead of holding it
+        frozen. Gates the whole teacher-update block in ray_trainer.
+    teacher_update_interval (int):
+        Steps between hard copies of student weights into the teacher. Used when
+        use_ema is False.
+    use_ema (bool):
+        Blend the student into the teacher with an exponential moving average
+        instead of hard-copying it.
+    ema_decay (float):
+        EMA coefficient: teacher <- decay * teacher + (1 - decay) * student.
+    ema_update_interval (int):
+        Steps between EMA blends. Used when use_ema is True.
     """
 
     _mutable_fields = BaseConfig._mutable_fields
@@ -156,6 +169,23 @@ class DistillationConfig(BaseConfig):
     num_workers: int = 8
     teacher_model: DistillationTeacherModelConfig = field(default_factory=DistillationTeacherModelConfig)
     distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
+
+    # Self-distillation teacher refresh.
+    #
+    # These five were read by ray_trainer (~line 1806) via getattr(cfg, name, default)
+    # but never declared here, which made them unreachable in BOTH directions:
+    # passing them with hydra's `+` raised
+    #   TypeError: DistillationConfig.__init__() got an unexpected keyword argument
+    # because omega_conf_to_dataclass instantiates this class, while omitting them
+    # left getattr on its default — and the default for self_distillation is False,
+    # which silently disables the entire teacher-update block. A run therefore either
+    # crashed at startup or trained with a teacher that was never refreshed, with no
+    # message either way. Declaring them makes the setting mean what it says.
+    self_distillation: bool = False
+    teacher_update_interval: int = 30
+    use_ema: bool = False
+    ema_decay: float = 0.999
+    ema_update_interval: int = 5
 
     def __post_init__(self):
         # Prompt + Response from student are fed into teacher as context
