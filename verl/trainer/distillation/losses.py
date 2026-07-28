@@ -591,6 +591,114 @@ def compute_bt_opd_loss(
     return distillation_losses, metrics
 
 
+# ── OPSD: On-Policy Self-Distillation baseline (arXiv:2601.18734, ICML 2026) ──
+# Rebuttal baseline arm: plain on-policy self-distillation against a privileged
+# (gold-answer-conditioned) teacher, with NONE of TT-OPD's additions:
+#   - NO turn-level truncation (BT_OPD_MAX_TURN is not read here),
+#   - NO bidirectional reward-sign flip (advantages are ignored),
+#   - NO top-k position filtering,
+#   - NO EMA teacher (the runner keeps the teacher frozen = OPSD's fixed_teacher).
+#
+# Faithfulness note (see hcgym_rebuttal/baselines/OPSD_PORT.md for the full
+# deviation list): the published OPSD loss is a full-vocabulary generalized JSD
+# (their released runs use beta=0, i.e. forward KL) computed from two forward
+# passes of the same network. This fork's sglang teacher path returns ONLY the
+# per-token logprob of the token the student actually sampled ([bsz, seq]), so
+# the full-vocabulary loss cannot be computed on this path. We use the closest
+# on-policy variant computable from sampled-token logprobs: the non-negative
+# low-variance reverse-KL estimator k3 (Schulman 2020), backpropagated directly
+# as a supervised loss exactly as OPSD backpropagates its JSD (no policy
+# gradient). OPSD's per-token `token_clip` (added because style tokens show
+# 6-15x higher KL than content tokens and dominate the gradient) maps directly
+# onto the non-negative per-token k3 values.
+#
+# Env config (read at CALL time so tests and launchers can toggle it):
+#   OPSD_TOKEN_CLIP: float. Per-token divergence clamp (their jsd_token_clip).
+#                    Unset / empty / <= 0 = clipping OFF (default).
+
+
+def _get_opsd_token_clip() -> Optional[float]:
+    """Per-token clip value for the OPSD loss; None = clipping disabled (default)."""
+    raw = os.environ.get("OPSD_TOKEN_CLIP", "").strip()
+    if not raw:
+        return None
+    value = float(raw)
+    return value if value > 0 else None
+
+
+@register_distillation_loss(
+    DistillationLossSettings(names=["opsd"], use_estimator=True)  # type: ignore[arg-type]
+)
+def compute_opsd_loss(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output: dict,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict]:
+    """OPSD baseline: token-level KL between student and (privileged) teacher on the
+    student's own on-policy trajectory, optionally clipped per token.
+
+    Returns:
+    - distillation_losses: (bsz, resp_len) per-token divergences; masking/aggregation
+      over ``response_mask`` is applied downstream by ``distillation_loss``.
+    - metrics: distributional statistics of the per-token KL for plotting.
+    """
+    student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
+    teacher_log_probs = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
+    response_mask_bool = data["response_mask"].bool()
+    assert teacher_log_probs.shape == student_log_probs.shape == response_mask_bool.shape
+
+    # NaN/inf sanitization — same handling as compute_bt_opd_loss, and load-bearing:
+    # teacher logprobs contain NaN at first-token positions and -inf at
+    # zero-probability tokens. NaN maps to -20.0 (≈ prob 2e-9), NOT 0.0 which would
+    # mean prob 1.0 and bias the KL.
+    t_nan = teacher_log_probs.isnan().sum().item()
+    t_inf = teacher_log_probs.isinf().sum().item()
+    s_nan = student_log_probs.isnan().sum().item()
+    s_inf = student_log_probs.isinf().sum().item()
+    if t_nan > 0 or t_inf > 0 or s_nan > 0 or s_inf > 0:
+        print(f"[OPSD] sanitized teacher NaN={t_nan} inf={t_inf} | student NaN={s_nan} inf={s_inf}")
+    teacher_log_probs = torch.nan_to_num(teacher_log_probs, nan=-20.0, posinf=0.0, neginf=-20.0)
+    student_log_probs = torch.nan_to_num(student_log_probs, nan=-20.0, posinf=0.0, neginf=-20.0)
+
+    # Per-token divergence along the student's on-policy trajectory.
+    # k3 = exp(t - s) - (t - s) - 1 >= 0; its gradient w.r.t. the student depends on
+    # the teacher, so direct supervised backprop is valid (unlike k1).
+    distillation_losses = kl_penalty(
+        logprob=student_log_probs, ref_logprob=teacher_log_probs, kl_penalty="low_var_kl"
+    )
+
+    # OPSD's per-token point-wise clipping: cap each token's divergence contribution.
+    token_clip = _get_opsd_token_clip()
+    num_valid = response_mask_bool.sum().clamp(min=1)
+    if token_clip is not None:
+        clipped_mask = (distillation_losses > token_clip) & response_mask_bool
+        clip_frac = clipped_mask.sum().float() / num_valid.float()
+        distillation_losses = distillation_losses.clamp(max=token_clip)
+    else:
+        clip_frac = torch.zeros((), device=distillation_losses.device)
+
+    # Distributional metrics over valid response tokens (for plotting the KL distribution).
+    valid = distillation_losses[response_mask_bool].detach().float()
+    signed_k1 = (student_log_probs - teacher_log_probs)[response_mask_bool].detach().float()
+    if valid.numel() == 0:
+        valid = torch.zeros(1, device=distillation_losses.device)
+        signed_k1 = torch.zeros(1, device=distillation_losses.device)
+    quantiles = torch.quantile(valid, torch.tensor([0.5, 0.9, 0.99], device=valid.device))
+    metrics = {
+        "opsd/kl_mean": Metric(AggregationType.MEAN, valid.mean()),
+        "opsd/kl_p50": Metric(AggregationType.MEAN, quantiles[0]),
+        "opsd/kl_p90": Metric(AggregationType.MEAN, quantiles[1]),
+        "opsd/kl_p99": Metric(AggregationType.MEAN, quantiles[2]),
+        "opsd/kl_max": Metric(AggregationType.MAX, valid.max()),
+        "opsd/k1_signed_mean": Metric(AggregationType.MEAN, signed_k1.mean()),
+        "opsd/token_clip": float(token_clip) if token_clip is not None else 0.0,
+        "opsd/clip_frac": Metric(AggregationType.MEAN, clip_frac),
+    }
+
+    return distillation_losses, metrics
+
+
 # ── RLAD: Reinforcement-Aware Knowledge Distillation ────────────────
 # arXiv:2602.22495 — Trust Region Ratio Distillation (TRRD)
 # Unifies policy gradient and distillation into a single importance ratio:

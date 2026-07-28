@@ -112,6 +112,10 @@ class TeacherModelManager:
             load_balancer_handle=self.load_balancer_handle,
             distillation_config=self.config,
             pad_token_id=self.pad_token_id,
+            # Required for token injection into the teacher context (OPSD gold
+            # conditioning and hint-OPD): without it _tokenizer is None and
+            # injection is silently skipped.
+            tokenizer=self.tokenizer,
         )
 
     def _initialize_router(self):

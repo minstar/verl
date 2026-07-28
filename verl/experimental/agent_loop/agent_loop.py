@@ -456,6 +456,9 @@ class AgentLoopWorker:
                         load_balancer_handle=teacher_load_balancer_handle,
                         distillation_config=self.distillation_config,
                         pad_token_id=self.model_config.tokenizer.pad_token_id,
+                        # Required for token injection into the teacher context
+                        # (OPSD gold conditioning): without it _tokenizer is None.
+                        tokenizer=self.model_config.tokenizer,
                     )
             else:
                 self.teacher_server_manager = None
@@ -723,6 +726,7 @@ class AgentLoopWorker:
             prompt_ids=output.prompt_ids,
             response_ids=output.response_ids,
             validate=validate,
+            sample_kwargs=kwargs,
         )
         teacher_ids, teacher_logprobs = (
             output.extra_fields.pop("teacher_ids", None),
@@ -857,12 +861,43 @@ class AgentLoopWorker:
             output.reward_score = result["reward_score"]
             output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
 
-    async def _compute_teacher_logprobs(self, output: AgentLoopOutput, prompt_ids, response_ids, validate):
-        """Compute teacher logprobs for single sample."""
+    async def _compute_teacher_logprobs(self, output: AgentLoopOutput, prompt_ids, response_ids, validate, sample_kwargs=None):
+        """Compute teacher logprobs for single sample.
+
+        With OPSD_GOLD_CONDITIONING=1, the sample's ground-truth answer (from
+        reward_model.ground_truth / extra_info.correct_answer in the sample's
+        non-tensor fields) is injected into the teacher context as a chat-templated
+        user turn before scoring — OPSD-style privileged conditioning
+        (arXiv:2601.18734). The injected span is stitched back out of the returned
+        logprobs so positions stay aligned with the student sequence. This is the
+        path actually taken when the teacher runs in its own resource pool
+        (enable_resource_pool=True); compute_teacher_logprobs_batch is bypassed.
+        Skipped for multimodal samples: inserting tokens shifts image placeholder
+        positions and breaks VLM processing.
+        """
         if self.stream_teacher_with_rollout and not validate:
+            from verl.experimental.teacher_loop import teacher_manager as _teacher_manager
+
+            hint_token_ids = None
+            original_length = None
+            multi_modal_data = output.multi_modal_data or {}
+            has_multimodal = bool(multi_modal_data.get("images") or multi_modal_data.get("videos"))
+            if _teacher_manager._OPSD_GOLD_CONDITIONING and not has_multimodal and sample_kwargs is not None:
+                gold_text = _teacher_manager._extract_gold_text_from_fields(
+                    sample_kwargs.get("reward_model"), sample_kwargs.get("extra_info")
+                )
+                if gold_text:
+                    hint_token_ids = self.teacher_server_manager._build_gold_tokens(gold_text, self.tokenizer)
+                    if hint_token_ids:
+                        original_length = len(prompt_ids)
+                else:
+                    print("[OPSD-Gold] no ground truth for sample; teacher scores without privileged context")
+
             teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
                 sequence_ids=prompt_ids + response_ids,
                 multi_modal_data=output.multi_modal_data,
+                hint_token_ids=hint_token_ids,
+                original_length=original_length,
             )
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
