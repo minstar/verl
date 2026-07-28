@@ -345,13 +345,24 @@ def apply_monkey_patch(
     )
 
     if is_trl_available():
-        from trl import AutoModelForCausalLMWithValueHead  # type: ignore
+        # is_trl_available() only proves the PACKAGE imports. TRL removed
+        # AutoModelForCausalLMWithValueHead in 1.x, so on any modern TRL the
+        # import below raises ImportError and takes model init down with it —
+        # and only for installs that HAVE trl, which makes it look like an
+        # unrelated failure. The patch is a compatibility shim for TRL's
+        # value-head model, which this trainer never builds, so skipping it when
+        # the class is gone costs nothing.
+        try:
+            from trl import AutoModelForCausalLMWithValueHead  # type: ignore
+        except ImportError:
+            AutoModelForCausalLMWithValueHead = None
 
-        def state_dict(self, *args, **kwargs):
-            return torch.nn.Module.state_dict(self, *args, **kwargs)
+        if AutoModelForCausalLMWithValueHead is not None:
+            def state_dict(self, *args, **kwargs):
+                return torch.nn.Module.state_dict(self, *args, **kwargs)
 
-        AutoModelForCausalLMWithValueHead.state_dict = state_dict
-        print("Monkey patch state_dict in AutoModelForCausalLMWithValueHead. ")
+            AutoModelForCausalLMWithValueHead.state_dict = state_dict
+            print("Monkey patch state_dict in AutoModelForCausalLMWithValueHead. ")
 
     # TODO: VLM models only, unify monkey patch to LLM models.
     if model.config.model_type in ["qwen2_5_vl", "qwen2_vl"]:
