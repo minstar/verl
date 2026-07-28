@@ -212,6 +212,12 @@ multi_turn:
   # Number of repeat rollouts for each interaction
   num_repeat_rollouts: null
 
+  # Pass every tool schema to apply_chat_template. Set False when the per-domain
+  # system message already lists the tools; a single placeholder schema is then
+  # passed so templates that gate tool-call instructions on a non-empty tool list
+  # still emit them.
+  inject_tool_schemas: True
+
 # support logging rollout prob for debugging purpose
 # "Truncated importance sampling" requires rollout log probs, set to True when turning on Truncated importance sampling
 calculate_log_probs: False

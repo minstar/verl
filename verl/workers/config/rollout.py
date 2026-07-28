@@ -86,6 +86,7 @@ class MultiTurnConfig(BaseConfig):
     tokenization_sanity_check_mode: str = "strict"
     format: str = "hermes"
     num_repeat_rollouts: Optional[int] = None
+    inject_tool_schemas: bool = True
 
 
 @dataclass
