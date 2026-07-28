@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import math
 import os
 from typing import Any, Optional
 from uuid import uuid4
@@ -38,6 +39,12 @@ _IM_START_TOKEN_ID: int | None = None
 _IM_END_TOKEN_ID: int | None = None
 # Rendered hint token ids, keyed by is_correct. The hint text is fixed per run.
 _HINT_TOKEN_CACHE: dict[bool, list[int]] = {}
+# A trajectory reward strictly above this counts as correct. The batch path has
+# always used `score > 0`; keep that as the default so hint semantics are
+# unchanged, but name it instead of burying a bare literal. Under the hcgym
+# cosine reward a correct trajectory scores >= 0.7 and a wrong one scores in
+# [-0.5, 0.0], so 0.0 separates them cleanly.
+_HINT_OPD_CORRECT_THRESHOLD = float(os.environ.get("HINT_OPD_CORRECT_THRESHOLD", "0.0"))
 
 # ── OPSD gold-answer conditioning (arXiv:2601.18734 baseline) ──
 # Instead of the outcome-conditioned static hints above, condition the teacher on
@@ -171,6 +178,118 @@ def _stitch_out_injected_span(
     return teacher_ids, teacher_logprobs
 
 
+# ── Privileged teacher conditioning: one decision point for both teacher paths ──
+#
+# Two mutually exclusive privileged signals can be injected into the teacher
+# context before it scores the student's trajectory:
+#
+#   OPSD_GOLD_CONDITIONING=1  the sample's ground-truth answer (outcome-independent)
+#   HINT_OPD_ENABLED=1        an outcome-conditioned hint that states whether THIS
+#                             trajectory was correct (TT-OPD's mechanism)
+#
+# They are resolved here, in one function, called by both the agent-loop streaming
+# path and the batch/colocate path, so the two paths cannot drift apart again.
+# Precedence is explicit: gold wins, and enabling both is announced loudly rather
+# than silently picking one.
+INJECT_GOLD = "gold"
+INJECT_HINT_CORRECT = "hint:correct"
+INJECT_HINT_INCORRECT = "hint:incorrect"
+SKIP_DISABLED = "skip:disabled"
+SKIP_MULTIMODAL = "skip:multimodal"
+SKIP_NO_TOKENIZER = "skip:no-tokenizer"
+SKIP_GOLD_MISSING = "skip:gold-missing"
+SKIP_SCORE_MISSING = "skip:score-missing"
+SKIP_RENDER_FAILED = "skip:render-failed"
+
+_PRECEDENCE_ANNOUNCED = False
+
+
+def format_injection_reasons(reasons: dict[str, int]) -> str:
+    """Render an injection-reason histogram as one deterministic log line.
+
+    Injected counts are listed first so ``grep 'privileged injection'`` on a training
+    log answers "did hints actually fire, and on how many samples" at a glance.
+    """
+    injected = {k: v for k, v in reasons.items() if not k.startswith("skip:")}
+    skipped = {k: v for k, v in reasons.items() if k.startswith("skip:")}
+    parts = [f"injected={sum(injected.values())}"]
+    parts += [f"{k}={v}" for k, v in sorted(injected.items())]
+    parts.append(f"skipped={sum(skipped.values())}")
+    parts += [f"{k}={v}" for k, v in sorted(skipped.items())]
+    return " ".join(parts)
+
+
+def hint_correctness(reward_score) -> Optional[bool]:
+    """Correctness of one trajectory from its scalar reward, or None if unknowable.
+
+    Returns None — never a guess — when the score is missing, non-numeric or NaN.
+    Callers must suppress hint injection in that case: telling the teacher that a
+    wrong trajectory was correct is a worse signal than no privileged signal.
+    """
+    if reward_score is None:
+        return None
+    try:
+        score = float(reward_score)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(score):
+        return None
+    return score > _HINT_OPD_CORRECT_THRESHOLD
+
+
+def resolve_privileged_injection(
+    manager: "AsyncTeacherLLMServerManager",
+    tokenizer,
+    *,
+    has_multimodal: bool,
+    gold_text: Optional[str] = None,
+    reward_score: Optional[float] = None,
+) -> tuple[Optional[list[int]], str]:
+    """Decide what privileged turn (if any) to splice into the teacher context.
+
+    Returns ``(token_ids_or_None, reason)``. ``reason`` is one of the INJECT_*/SKIP_*
+    constants above; it is stable and both the unit tests and the rebuttal checker
+    assert on it.
+
+    Gold conditioning takes precedence over outcome-conditioned hints. When gold is
+    enabled there is deliberately NO fallback to hints for samples whose ground truth
+    is missing: mixing two different privileged signals across the samples of one run
+    would make the arm uninterpretable. Those samples are scored without conditioning.
+    """
+    global _PRECEDENCE_ANNOUNCED
+    if _OPSD_GOLD_CONDITIONING and _HINT_OPD_ENABLED and not _PRECEDENCE_ANNOUNCED:
+        _PRECEDENCE_ANNOUNCED = True
+        print(
+            "[Teacher] OPSD_GOLD_CONDITIONING=1 and HINT_OPD_ENABLED=1 are both set. "
+            "These are mutually exclusive privileged signals; gold conditioning takes "
+            "precedence and outcome-conditioned hints will NOT fire in this run."
+        )
+
+    if not (_OPSD_GOLD_CONDITIONING or _HINT_OPD_ENABLED):
+        return None, SKIP_DISABLED
+    if has_multimodal:
+        # Inserting tokens shifts image placeholder positions and breaks VLM processing.
+        return None, SKIP_MULTIMODAL
+    if tokenizer is None:
+        # __init__ raises when conditioning is enabled, so reaching here means a caller
+        # passed None explicitly; report it rather than silently scoring unconditioned.
+        return None, SKIP_NO_TOKENIZER
+
+    if _OPSD_GOLD_CONDITIONING:
+        if not gold_text:
+            return None, SKIP_GOLD_MISSING
+        gold_ids = manager._build_gold_tokens(gold_text, tokenizer)
+        return (gold_ids, INJECT_GOLD) if gold_ids else (None, SKIP_RENDER_FAILED)
+
+    is_correct = hint_correctness(reward_score)
+    if is_correct is None:
+        return None, SKIP_SCORE_MISSING
+    hint_ids = manager._build_hint_tokens(is_correct, tokenizer)
+    if not hint_ids:
+        return None, SKIP_RENDER_FAILED
+    return hint_ids, (INJECT_HINT_CORRECT if is_correct else INJECT_HINT_INCORRECT)
+
+
 def _resolve_special_token_ids(tokenizer) -> tuple[int, int]:
     """Resolve <|im_start|> and <|im_end|> token IDs from tokenizer."""
     global _IM_START_TOKEN_ID, _IM_END_TOKEN_ID
@@ -265,8 +384,17 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
         load_balancer_handle: ray.actor.ActorHandle,
         distillation_config: DictConfig | DistillationConfig,
         pad_token_id: int,
-        tokenizer=None,
+        tokenizer,
     ):
+        """``tokenizer`` is REQUIRED — deliberately no default.
+
+        Privileged teacher conditioning renders the injected turn with the model's own
+        chat template, so it cannot run without a tokenizer/processor. This parameter
+        used to default to None while neither construction site passed one, which made
+        every hint silently no-op for the entire v15-v25 run series. A required
+        parameter cannot be forgotten, and passing None explicitly while conditioning
+        is enabled raises instead of degrading quietly.
+        """
         super().__init__(config=config, servers=servers, load_balancer_handle=load_balancer_handle)
         if isinstance(distillation_config, DistillationConfig):
             self.distillation_config = distillation_config
@@ -275,6 +403,19 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
         self.distillation_loss_config: DistillationLossConfig = self.distillation_config.distillation_loss
         self.pad_token_id = pad_token_id
         self._tokenizer = tokenizer
+        if tokenizer is None:
+            message = (
+                "AsyncTeacherLLMServerManager was constructed with tokenizer=None. The "
+                "injected privileged turn (HINT_OPD_ENABLED / OPSD_GOLD_CONDITIONING) is "
+                "rendered with the model's chat template and cannot be built without it."
+            )
+            if _HINT_OPD_ENABLED or _OPSD_GOLD_CONDITIONING:
+                raise ValueError(
+                    message + " Privileged conditioning is ENABLED for this run, so refusing "
+                    "to start rather than training a mechanism that never fires. Pass the "
+                    "tokenizer (or processor) at the construction site."
+                )
+            print("[Teacher] " + message + " No conditioning is enabled, so this is only a warning.")
 
     async def compute_teacher_logprobs_single(
         self,
@@ -407,8 +548,10 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
 
         If OPSD_GOLD_CONDITIONING=1, injects the sample's ground-truth answer into
         the teacher sequence (OPSD-style privileged conditioning). Otherwise, if
-        HINT_OPD_ENABLED=1, injects reward-based hints (Bidirectional Hint-OPD).
-        Gold conditioning takes precedence over hints.
+        HINT_OPD_ENABLED=1, injects the outcome-conditioned hint for this sample's
+        trajectory (TT-OPD). Precedence and every skip reason are decided by the
+        shared resolve_privileged_injection, the same function the agent-loop
+        streaming path calls, so the two paths cannot diverge.
         """
         multi_modal_data_batch = data.non_tensor_batch.get("teacher_multi_modal_data")
         tasks = []
@@ -416,22 +559,14 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
         prompt_width = data.batch["prompts"].shape[1]
         response_width = data.batch["responses"].shape[1]
 
-        # Check for reward data to determine hint direction
-        # rm_scores is set by extract_reward() before teacher logprob computation
-        has_rewards = "rm_scores" in data.batch
-        reward_scores = None
-        if has_rewards and _HINT_OPD_ENABLED:
-            # rm_scores shape: [batch_size, seq_len] — sum to get trajectory reward
-            reward_scores = data.batch["rm_scores"].sum(dim=-1)
+        # Trajectory-level reward, used to pick the hint direction. rm_scores is set by
+        # extract_reward() before teacher logprob computation; shape [bsz, seq_len], so
+        # sum over the sequence to recover the scalar trajectory reward. Absent here
+        # means the score is unknown and hints are suppressed (never guessed).
+        reward_scores = data.batch["rm_scores"].sum(dim=-1) if "rm_scores" in data.batch else None
 
-        # Get tokenizer for hint encoding
-        tokenizer = getattr(self, '_tokenizer', None)
-        if tokenizer is None and hasattr(self, 'config') and hasattr(self.config, 'tokenizer'):
-            tokenizer = self.config.tokenizer
-
-        num_with_hints = 0
-        num_with_gold = 0
-        num_missing_gold = 0
+        tokenizer = self._tokenizer
+        reasons: dict[str, int] = {}
         # Compute logprobs for each sample in the batch
         for i in range(len(data)):
             item = data[i : i + 1]
@@ -439,29 +574,18 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
             multi_modal_data = None if multi_modal_data_batch is None else multi_modal_data_batch[i]
             lengths.append((prompt_length, response_length))
 
-            # Build injected-turn tokens (gold answer or reward hint).
-            # Skip injection for samples with images/videos — inserting tokens
-            # shifts image placeholder positions and breaks VLM processing
-            hint_token_ids = None
-            has_multimodal = multi_modal_data is not None and (
-                multi_modal_data.get("images") or multi_modal_data.get("videos")
+            has_multimodal = bool(
+                multi_modal_data is not None
+                and (multi_modal_data.get("images") or multi_modal_data.get("videos"))
             )
-            if tokenizer is not None and not has_multimodal:
-                if _OPSD_GOLD_CONDITIONING:
-                    # OPSD-style privileged conditioning: per-sample ground-truth answer.
-                    # Outcome-independent by design — no reward signal is consulted.
-                    gold_text = _extract_gold_text(data, i)
-                    if gold_text:
-                        hint_token_ids = self._build_gold_tokens(gold_text, tokenizer)
-                        if hint_token_ids:
-                            num_with_gold += 1
-                    else:
-                        num_missing_gold += 1
-                elif reward_scores is not None and _HINT_OPD_ENABLED:
-                    is_correct = float(reward_scores[i]) > 0
-                    hint_token_ids = self._build_hint_tokens(is_correct, tokenizer)
-                    if hint_token_ids:
-                        num_with_hints += 1
+            hint_token_ids, reason = resolve_privileged_injection(
+                self,
+                tokenizer,
+                has_multimodal=has_multimodal,
+                gold_text=_extract_gold_text(data, i) if _OPSD_GOLD_CONDITIONING else None,
+                reward_score=None if reward_scores is None else reward_scores[i],
+            )
+            reasons[reason] = reasons.get(reason, 0) + 1
 
             # Pass image/video data to teacher for VLM-aware logprob computation.
             # return_exceptions=True in asyncio.gather provides fallback if alignment fails.
@@ -476,13 +600,8 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
                 )
             )
 
-        if _OPSD_GOLD_CONDITIONING:
-            print(f"[OPSD-Gold] Injected gold answers into {num_with_gold}/{len(data)} samples "
-                  f"(missing ground truth: {num_missing_gold}, "
-                  f"other skips: {len(data) - num_with_gold - num_missing_gold})")
-        elif _HINT_OPD_ENABLED:
-            num_skipped_mm = len(data) - num_with_hints
-            print(f"[Hint-OPD] Injected hints into {num_with_hints}/{len(data)} samples (skipped {num_skipped_mm} multimodal)")
+        if _OPSD_GOLD_CONDITIONING or _HINT_OPD_ENABLED:
+            print(f"[Teacher-batch] privileged injection over {len(data)} samples: " + format_injection_reasons(reasons))
 
         # Use return_exceptions to avoid crashing the entire batch on a single failure
         outputs_raw = await asyncio.gather(*tasks, return_exceptions=True)

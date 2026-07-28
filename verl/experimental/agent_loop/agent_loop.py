@@ -457,13 +457,21 @@ class AgentLoopWorker:
                         distillation_config=self.distillation_config,
                         pad_token_id=self.model_config.tokenizer.pad_token_id,
                         # Required for token injection into the teacher context
-                        # (OPSD gold conditioning): without it _tokenizer is None.
+                        # (OPSD gold conditioning, TT-OPD outcome-conditioned hints):
+                        # without it the injected turn cannot be rendered. The
+                        # parameter has no default, so this cannot be dropped again.
                         tokenizer=self.model_config.tokenizer,
                     )
             else:
                 self.teacher_server_manager = None
         else:
             self.stream_teacher_with_rollout = False
+
+        # Privileged-injection accounting for the streaming teacher path, so a run log
+        # can be grepped for whether hints actually fired. See _log_injection.
+        self._injection_reasons: dict[str, int] = {}
+        self._injection_seen = 0
+        self._injection_log_every = int(os.environ.get("HINT_OPD_LOG_EVERY", "64"))
 
         # for recipe to change
         if not hasattr(self, "server_manager"):
@@ -861,37 +869,73 @@ class AgentLoopWorker:
             output.reward_score = result["reward_score"]
             output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
 
-    async def _compute_teacher_logprobs(self, output: AgentLoopOutput, prompt_ids, response_ids, validate, sample_kwargs=None):
-        """Compute teacher logprobs for single sample.
+    def _log_injection(self, reason: str) -> None:
+        """Accumulate privileged-injection outcomes and log them periodically.
 
-        With OPSD_GOLD_CONDITIONING=1, the sample's ground-truth answer (from
-        reward_model.ground_truth / extra_info.correct_answer in the sample's
-        non-tensor fields) is injected into the teacher context as a chat-templated
-        user turn before scoring — OPSD-style privileged conditioning
-        (arXiv:2601.18734). The injected span is stitched back out of the returned
-        logprobs so positions stay aligned with the student sequence. This is the
-        path actually taken when the teacher runs in its own resource pool
-        (enable_resource_pool=True); compute_teacher_logprobs_batch is bypassed.
-        Skipped for multimodal samples: inserting tokens shifts image placeholder
-        positions and breaks VLM processing.
+        Per-sample printing would drown the training log, and printing nothing is how
+        the original defect stayed invisible for eighteen run versions. So: announce
+        the first occurrence of every distinct reason, then a histogram every
+        HINT_OPD_LOG_EVERY samples.
+        """
+        if reason not in self._injection_reasons:
+            print(f"[Teacher-stream] privileged injection reason first seen: {reason}")
+        self._injection_reasons[reason] = self._injection_reasons.get(reason, 0) + 1
+        self._injection_seen += 1
+        if self._injection_log_every > 0 and self._injection_seen % self._injection_log_every == 0:
+            from verl.experimental.teacher_loop.teacher_manager import format_injection_reasons
+
+            print(
+                f"[Teacher-stream] privileged injection over {self._injection_seen} samples: "
+                + format_injection_reasons(self._injection_reasons)
+            )
+
+    async def _compute_teacher_logprobs(self, output: AgentLoopOutput, prompt_ids, response_ids, validate, sample_kwargs=None):
+        """Compute teacher logprobs for single sample, with privileged conditioning.
+
+        This is the path actually taken when the teacher runs in its own resource pool
+        (enable_resource_pool=True), which every run script from v26 on uses;
+        compute_teacher_logprobs_batch is bypassed entirely. Two mutually exclusive
+        privileged signals can be spliced into the teacher context here as a
+        chat-templated user turn, with gold taking precedence (both resolved by the
+        shared teacher_manager.resolve_privileged_injection):
+
+          OPSD_GOLD_CONDITIONING=1  the sample's ground-truth answer, from
+                                    reward_model.ground_truth / extra_info.correct_answer
+                                    (arXiv:2601.18734) — outcome-independent.
+          HINT_OPD_ENABLED=1        TT-OPD's outcome-conditioned hint, which states
+                                    whether THIS trajectory was correct. Correctness
+                                    comes from output.reward_score, which _compute_score
+                                    deposits on the line immediately before this call
+                                    (the async reward loop worker is active whenever
+                                    there is no separate reward model). If the score is
+                                    missing, injection is suppressed rather than
+                                    defaulted — a hint asserting the wrong outcome is a
+                                    worse teacher signal than no hint.
+
+        The injected span is stitched back out of the returned logprobs so positions stay
+        aligned with the student sequence. Skipped for multimodal samples: inserting
+        tokens shifts image placeholder positions and breaks VLM processing.
         """
         if self.stream_teacher_with_rollout and not validate:
             from verl.experimental.teacher_loop import teacher_manager as _teacher_manager
 
-            hint_token_ids = None
-            original_length = None
             multi_modal_data = output.multi_modal_data or {}
             has_multimodal = bool(multi_modal_data.get("images") or multi_modal_data.get("videos"))
-            if _teacher_manager._OPSD_GOLD_CONDITIONING and not has_multimodal and sample_kwargs is not None:
+            gold_text = None
+            if _teacher_manager._OPSD_GOLD_CONDITIONING and sample_kwargs is not None:
                 gold_text = _teacher_manager._extract_gold_text_from_fields(
                     sample_kwargs.get("reward_model"), sample_kwargs.get("extra_info")
                 )
-                if gold_text:
-                    hint_token_ids = self.teacher_server_manager._build_gold_tokens(gold_text, self.tokenizer)
-                    if hint_token_ids:
-                        original_length = len(prompt_ids)
-                else:
-                    print("[OPSD-Gold] no ground truth for sample; teacher scores without privileged context")
+
+            hint_token_ids, reason = _teacher_manager.resolve_privileged_injection(
+                self.teacher_server_manager,
+                self.tokenizer,
+                has_multimodal=has_multimodal,
+                gold_text=gold_text,
+                reward_score=output.reward_score,
+            )
+            original_length = len(prompt_ids) if hint_token_ids else None
+            self._log_injection(reason)
 
             teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
                 sequence_ids=prompt_ids + response_ids,

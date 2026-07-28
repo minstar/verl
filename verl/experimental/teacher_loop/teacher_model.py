@@ -113,8 +113,10 @@ class TeacherModelManager:
             distillation_config=self.config,
             pad_token_id=self.pad_token_id,
             # Required for token injection into the teacher context (OPSD gold
-            # conditioning and hint-OPD): without it _tokenizer is None and
-            # injection is silently skipped.
+            # conditioning and TT-OPD outcome-conditioned hints): the injected turn
+            # is rendered with the model's chat template. The parameter has no
+            # default, so it cannot be silently dropped again. self.tokenizer is the
+            # processor for VLMs; _render_user_turn_tokens unwraps .tokenizer from it.
             tokenizer=self.tokenizer,
         )
 
