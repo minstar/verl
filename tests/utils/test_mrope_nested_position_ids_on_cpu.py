@@ -213,6 +213,49 @@ def test_dp_dispatch_and_micro_batching_keep_positions_aligned(lengths):
 
 
 # --------------------------------------------------------------------------------------
+# the padded (use_remove_padding=False) branch of prepare_model_inputs
+# --------------------------------------------------------------------------------------
+
+
+def test_attention_mask_covers_the_whole_sequence_not_just_the_response():
+    """``use_remove_padding=False`` must not mask out the tail of a sequence.
+
+    ``prepare_model_inputs`` used to build the padded branch's attention mask from
+    ``loss_mask``, which ``left_right_2_no_padding`` aliases to the *response* mask
+    (length ``max_response_length``). Padding that up to the full sequence length marked
+    the last ``seq_len - max_response_length`` tokens -- the tail of the response -- as
+    padding on every sample.
+    """
+    from verl.workers.engine.utils import attention_mask_from_seq_lens
+
+    lengths = [(20, 128), (30, 100)]
+    td = left_right_2_no_padding(_make_left_right_padded_batch(lengths))
+
+    input_ids = td["input_ids"]
+    seq_len_effective = input_ids.offsets().diff()
+    max_seq_len = max(seq_len_effective)
+    assert seq_len_effective.tolist() == [p + r for p, r in lengths]
+
+    attention_mask = attention_mask_from_seq_lens(seq_len_effective, max_seq_len)
+    assert attention_mask.shape == (len(lengths), int(max_seq_len))
+    assert attention_mask.sum(dim=1).tolist() == seq_len_effective.tolist()
+    for i, total in enumerate(seq_len_effective.tolist()):
+        assert attention_mask[i, :total].all(), "real tokens must be visible"
+        assert not attention_mask[i, total:].any(), "padding must be masked"
+
+    # the old derivation, kept here so the regression is legible
+    stale = torch.nested.to_padded_tensor(
+        torch.nested.as_nested_tensor(
+            [torch.ones_like(t, dtype=torch.int32) for t in td["loss_mask"]], layout=torch.jagged
+        ),
+        padding=0,
+        output_size=(len(lengths), max_seq_len),
+    )
+    assert stale.sum(dim=1).tolist() == [MAX_RESPONSE_LEN] * len(lengths)
+    assert stale.sum(dim=1).tolist() != seq_len_effective.tolist()
+
+
+# --------------------------------------------------------------------------------------
 # drive the model code that raised the original error
 # --------------------------------------------------------------------------------------
 

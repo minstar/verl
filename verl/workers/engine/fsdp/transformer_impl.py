@@ -72,7 +72,12 @@ from verl.utils.ulysses import (
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
-from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
+from ..utils import (
+    attention_mask_from_seq_lens,
+    enable_full_determinism,
+    postprocess_batch_func,
+    prepare_micro_batches,
+)
 from .utils import create_device_mesh, get_sharding_strategy
 
 logger = logging.getLogger(__file__)
@@ -960,7 +965,6 @@ class FSDPEngineWithLMHead(FSDPEngine):
             if pad_mode == DatasetPadMode.NO_PADDING:
                 input_ids = micro_batch["input_ids"]
                 position_ids = micro_batch["position_ids"]
-                loss_mask = micro_batch["loss_mask"]
 
                 pad_token_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
                 batch_size = micro_batch.batch_size[0]
@@ -985,11 +989,13 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         position_ids, padding=0, output_size=(batch_size, max_seq_len)
                     )
 
-                attention_mask_list = [torch.ones_like(t, dtype=torch.int32) for t in loss_mask]
-                attention_mask = torch.nested.as_nested_tensor(attention_mask_list, layout=torch.jagged)
-                attention_mask = torch.nested.to_padded_tensor(
-                    attention_mask, padding=0, output_size=(batch_size, max_seq_len)
-                )
+                # Mark the real tokens of every sample, i.e. undo exactly the padding that
+                # to_padded_tensor just introduced. This used to be derived from "loss_mask",
+                # which only holds for datasets whose loss_mask spans the whole sequence: on
+                # the RL path left_right_2_no_padding aliases loss_mask to the *response* mask
+                # (length max_response_length), so the mask ended up marking the last
+                # seq_len - max_response_length tokens of every sequence as padding.
+                attention_mask = attention_mask_from_seq_lens(seq_len_effective, max_seq_len).to(input_ids.device)
 
                 model_inputs = {
                     "input_ids": input_ids,

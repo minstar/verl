@@ -56,6 +56,24 @@ def enable_full_determinism(seed: int):
         torch.npu.manual_seed_all(seed)
 
 
+def attention_mask_from_seq_lens(seq_len_effective: torch.Tensor, max_seq_len: int) -> torch.Tensor:
+    """Build a right-padding attention mask from per-sample sequence lengths.
+
+    Marks the real tokens of every sample, i.e. undoes exactly the padding that
+    ``torch.nested.to_padded_tensor(..., output_size=(bsz, max_seq_len))`` introduces.
+
+    Args:
+        seq_len_effective: (bsz,) number of real tokens per sample.
+        max_seq_len: padded sequence length.
+
+    Returns:
+        (bsz, max_seq_len) int32 mask.
+    """
+    device = seq_len_effective.device
+    positions = torch.arange(int(max_seq_len), device=device).unsqueeze(0)
+    return (positions < seq_len_effective.unsqueeze(1)).to(torch.int32)
+
+
 def prepare_micro_batches(
     data: TensorDict,
     dp_group=None,
