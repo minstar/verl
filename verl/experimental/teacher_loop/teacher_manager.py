@@ -36,6 +36,8 @@ _HINT_INCORRECT = os.environ.get("HINT_OPD_INCORRECT",
     "Hint: The model's answer is incorrect. Reconsider the reasoning and choose the correct option.")
 _IM_START_TOKEN_ID: int | None = None
 _IM_END_TOKEN_ID: int | None = None
+# Rendered hint token ids, keyed by is_correct. The hint text is fixed per run.
+_HINT_TOKEN_CACHE: dict[bool, list[int]] = {}
 
 
 def _resolve_special_token_ids(tokenizer) -> tuple[int, int]:
@@ -231,22 +233,47 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
     def _build_hint_tokens(self, is_correct: bool, tokenizer=None) -> Optional[list[int]]:
         """Build hint token IDs for injection into teacher sequence.
 
-        Constructs a Qwen3.5 chat-format hint message:
-        <|im_start|>user\n{hint}<|im_end|>\n
+        Renders the hint as one user turn using the model's own chat template, so
+        the same code path works for ChatML (Qwen), Gemma, Llama and others. Falls
+        back to literal ChatML only if the template cannot be applied.
         """
         if not _HINT_OPD_ENABLED:
             return None
+        if tokenizer is None:
+            return None
+
+        cached = _HINT_TOKEN_CACHE.get(is_correct)
+        if cached is not None:
+            return cached
+
         hint_text = _HINT_CORRECT if is_correct else _HINT_INCORRECT
-        # Encode as Qwen3.5 user message: <|im_start|>user\n{hint}<|im_end|>\n
-        if tokenizer is not None:
-            # Handle VLM processors (e.g., Qwen3VLProcessor) which wrap a text tokenizer
-            text_tokenizer = getattr(tokenizer, 'tokenizer', tokenizer)
-            hint_content = f"user\n{hint_text}"
-            content_ids = text_tokenizer.encode(hint_content, add_special_tokens=False)
+        # Handle VLM processors (e.g., Qwen3VLProcessor) which wrap a text tokenizer
+        text_tokenizer = getattr(tokenizer, 'tokenizer', tokenizer)
+
+        hint_ids: Optional[list[int]] = None
+        try:
+            rendered = text_tokenizer.apply_chat_template(
+                [{"role": "user", "content": hint_text}],
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+            # The hint is spliced into the middle of an existing sequence, so any
+            # sequence-start marker the template prepends must be dropped.
+            bos = getattr(text_tokenizer, "bos_token", None)
+            if bos and rendered.startswith(bos):
+                rendered = rendered[len(bos):]
+            hint_ids = text_tokenizer.encode(rendered, add_special_tokens=False)
+        except Exception as exc:
+            print(f"[Teacher] chat template unavailable for hint ({exc}); using ChatML fallback")
+
+        if not hint_ids:
+            content_ids = text_tokenizer.encode(f"user\n{hint_text}", add_special_tokens=False)
             im_start, im_end = _resolve_special_token_ids(text_tokenizer)
-            return [im_start] + content_ids + [im_end, 198]  # 198 = \n
-        # Fallback: just return None if no tokenizer
-        return None
+            newline_ids = text_tokenizer.encode("\n", add_special_tokens=False)
+            hint_ids = [im_start] + content_ids + [im_end] + newline_ids
+
+        _HINT_TOKEN_CACHE[is_correct] = hint_ids
+        return hint_ids
 
     async def compute_teacher_logprobs_batch(self, data: DataProto) -> DataProto:
         """Compute teacher log probabilities for a batch of prompt-response pairs.
