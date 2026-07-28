@@ -283,9 +283,15 @@ def deserialize_tensordict(arr: Any) -> TensorDict:
             # decode nested tensor
             layout, data = v
             torch_layout = getattr(torch, layout)
-            decoded_items[k] = torch.nested.as_nested_tensor(
-                [deserialize_single_tensor(tensor) for tensor in data], layout=torch_layout
-            )
+            components = [deserialize_single_tensor(tensor) for tensor in data]
+            if torch_layout == torch.jagged:
+                # pin the ragged dim to the sequence dim instead of letting
+                # torch.nested.as_nested_tensor() infer it from the data
+                from verl.utils.tensordict_utils import as_nested_tensor_ragged_last
+
+                decoded_items[k] = as_nested_tensor_ragged_last(components)
+            else:
+                decoded_items[k] = torch.nested.as_nested_tensor(components, layout=torch_layout)
         else:
             raise ValueError(f"Invalid tensor encoding format, expected length 2 or 3, got {len(v)}")
 

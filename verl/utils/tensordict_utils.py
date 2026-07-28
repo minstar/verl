@@ -20,6 +20,51 @@ from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorData, NonTensorStack
 
 
+def as_nested_tensor_ragged_last(tensors: list[torch.Tensor]) -> torch.Tensor:
+    """Stack per-sample tensors into a jagged NestedTensor whose ragged dim is the *last* dim.
+
+    ``torch.nested.as_nested_tensor(list, layout=torch.jagged)`` does not take the ragged
+    dimension as an argument, it *infers* it: it looks for the dimension whose size differs
+    across the list and falls back to dim 1 when every sample has an identical shape. For
+    1D per-sample tensors (``input_ids``, ``loss_mask``) there is only one candidate, so the
+    inference is always right. For the 3D mRoPE ``position_ids`` of a VLM -- per sample
+    ``(n_mrope_sections, seq_len)`` -- the inference is *data dependent*:
+
+    * sequence lengths differ  -> ragged dim 2, ``values()`` is ``(n_sections, total_tokens)``
+      and ``offsets()`` counts tokens. This is what every consumer in verl assumes.
+    * sequence lengths are all equal (e.g. two rollouts of the same prompt that both hit
+      ``max_response_length``, or a group of size one) -> ragged dim 1, ``values()`` becomes
+      ``(B * n_sections, seq_len)`` and ``offsets()`` counts *sections*. The tensor is now
+      silently mislabelled: downstream code reads ``n_sections`` as a token count.
+
+    Building the tensor from explicit values/offsets removes the inference entirely, so the
+    layout no longer depends on whether the sequence lengths in a group happen to collide.
+
+    Args:
+        tensors: Non-empty list of per-sample tensors. All must have the same rank and the
+            same leading (non-ragged) dims; only the last dim may vary.
+
+    Returns:
+        A contiguous jagged NestedTensor of shape ``(len(tensors), *leading_dims, j)``.
+    """
+    assert len(tensors) > 0, "cannot build a nested tensor from an empty list"
+    first = tensors[0]
+    ndim = first.dim()
+    assert ndim >= 1, f"per-sample tensors must have at least one dim. Got {first.shape}"
+    for t in tensors:
+        assert t.dim() == ndim, f"inconsistent rank in nested tensor components: {t.shape} vs {first.shape}"
+        assert t.shape[:-1] == first.shape[:-1], (
+            f"only the last (ragged) dim may vary across samples. Got {t.shape} vs {first.shape}"
+        )
+
+    values = torch.cat(tensors, dim=-1).contiguous()
+    lengths = torch.tensor([t.shape[-1] for t in tensors], dtype=torch.int64, device=values.device)
+    offsets = torch.zeros(len(tensors) + 1, dtype=torch.int64, device=values.device)
+    torch.cumsum(lengths, dim=0, out=offsets[1:])
+    # jagged_dim is the index of the ragged dim in the *nested* tensor, i.e. the last one.
+    return torch.nested.nested_tensor_from_jagged(values, offsets=offsets, jagged_dim=ndim)
+
+
 def assign_non_tensor_data(tensor_dict: TensorDict, key, val):
     """Assign a single non-tensor value to a TensorDict.
 
@@ -188,7 +233,8 @@ def concat_nested_tensors(tensors: list[torch.Tensor]) -> torch.Tensor:
         unbind_tensor = tensor.unbind(0)
         unbind_tensors.extend(list(unbind_tensor))
 
-    tensor = torch.nested.as_nested_tensor(unbind_tensors, layout=torch.jagged)
+    # keep the ragged dim pinned to the sequence dim, see as_nested_tensor_ragged_last
+    tensor = as_nested_tensor_ragged_last(unbind_tensors)
     return tensor
 
 
@@ -292,24 +338,21 @@ def chunk_tensordict(td: TensorDict, chunks: int) -> list[TensorDict]:
             evenly divisible by chunks.
 
     Note:
-        PyTorch ``unbind(dim=0)`` on 3D+ jagged NestedTensors has a bug where
-        ``split_with_sizes`` is applied to the wrong dimension of the internal
-        ``_values`` tensor.  For example, mRoPE ``position_ids`` with per-sample
-        shape ``(4, seq_len)`` becomes a 3D jagged NestedTensor
-        ``[B, *(ragged=4), seq_len]``; ``_values`` is ``[B*4, seq_len]`` and
-        ``unbind`` erroneously splits dimension 1 (``seq_len``) instead of
-        dimension 0, causing::
+        Each chunk's NestedTensors are rebuilt with :func:`as_nested_tensor_ragged_last`
+        rather than ``torch.nested.as_nested_tensor``. The latter re-infers which dim is
+        ragged from the *chunk's* contents, so a chunk whose sequence lengths happen to be
+        identical would come out ragged over the mRoPE-section dim instead of the sequence
+        dim. See :func:`as_nested_tensor_ragged_last` for the full explanation.
+
+        ``unbind(dim=0)`` on a 3D jagged NestedTensor that is (correctly) ragged over its
+        last dim works fine. It only fails for the mislabelled section-ragged variant,
+        where ``_values`` is ``[B*n_sections, seq_len]`` and ``split_with_sizes`` is
+        applied to the wrong dim::
 
             RuntimeError: split_with_sizes expects split_sizes to sum exactly
             to <seq_len>, but got split_sizes=[4, 4, ...]
 
-        2D jagged NestedTensors (e.g. ``input_ids``, ``loss_mask``) are
-        unaffected — ``unbind(dim=0)`` works correctly for them.
-
-        The workaround: try ``unbind`` first (fast path for 2D); on failure,
-        fall back to ``to_padded_tensor`` → ``chunk`` → reconstruct per-chunk
-        NestedTensors using the original ragged lengths from ``offsets``.
-
+        The ``to_padded_tensor`` fallback below is kept as a safety net.
         See https://github.com/pytorch/pytorch/issues/153238
     """
     assert isinstance(td, TensorDict) and len(td) % chunks == 0, (
@@ -333,14 +376,13 @@ def chunk_tensordict(td: TensorDict, chunks: int) -> list[TensorDict]:
             lengths = offsets.diff().tolist()
             for i, chunk_td in enumerate(tds):
                 chunk_lengths = lengths[i * chunk_size : (i + 1) * chunk_size]
-                chunk_tensors = [padded_chunks[i][j, :seq_len] for j, seq_len in enumerate(chunk_lengths)]
-                chunk_td[key] = torch.nested.as_nested_tensor(chunk_tensors, layout=torch.jagged)
+                # slice the *last* (ragged) dim; padded_chunks[i][j] is (*leading_dims, max_len)
+                chunk_tensors = [padded_chunks[i][j][..., :seq_len] for j, seq_len in enumerate(chunk_lengths)]
+                chunk_td[key] = as_nested_tensor_ragged_last(chunk_tensors)
             continue
 
         for i, chunk_td in enumerate(tds):
-            chunk_td[key] = torch.nested.as_nested_tensor(
-                tensors[i * chunk_size : (i + 1) * chunk_size], layout=torch.jagged
-            )
+            chunk_td[key] = as_nested_tensor_ragged_last(list(tensors[i * chunk_size : (i + 1) * chunk_size]))
 
     return tds
 
@@ -462,9 +504,10 @@ def index_select_tensor_dict(batch: TensorDict, indices: torch.Tensor | list[int
                 data_dict[key] = tensor[indices]
             elif isinstance(tensor, torch.Tensor) and tensor.is_nested:
                 tensor_lst = tensor.unbind()  # for performance
-                data_dict[key] = torch.nested.as_nested_tensor(
-                    [tensor_lst[idx] for idx in indices], layout=torch.jagged
-                )
+                # NOT torch.nested.as_nested_tensor: it would re-infer the ragged dim from the
+                # selected rows alone, flipping 3D mRoPE position_ids to section-ragged whenever
+                # the selected sequences all happen to have the same length.
+                data_dict[key] = as_nested_tensor_ragged_last([tensor_lst[idx] for idx in indices])
             else:
                 # This handles NonTensorStack (indexable by batch dim) and NonTensorData (scalar metadata).
                 if tensor.shape:
@@ -879,5 +922,21 @@ def maybe_fix_3d_position_ids(data: TensorDict):
     # note for tensordict with pickle/unpickle. nested tensor in tensordict after consolidate and pickle/unpickle
     # will incur indexing error for ragged tensor. This only happens when using 3D position ids in VLMs.
     # This is likely a bug in tensordict. As a workaround, we manually set _ragged_index.
+    #
+    # This restores metadata that was lost in transit; it must never *change* the layout. The
+    # values/offsets survive the round trip, so we can check that the ragged dim really is the
+    # last one before relabelling: for a sequence-ragged tensor the values' last dim is the
+    # total token count, i.e. offsets[-1]. If that does not hold, the tensor was built ragged
+    # over the mRoPE-section dim (see as_nested_tensor_ragged_last) and forcing _ragged_idx=2
+    # would silently reinterpret "n_sections" as a token count, feeding the model position ids
+    # with a sequence length of n_sections * batch_size.
     if "position_ids" in data.keys() and data["position_ids"].dim() == 3 and data["position_ids"].is_nested:
-        data["position_ids"]._ragged_idx = 2
+        position_ids = data["position_ids"]
+        values, offsets = position_ids.values(), position_ids.offsets()
+        assert values.shape[-1] == offsets[-1].item(), (
+            "3D position_ids nested tensor is not ragged over its sequence dim: "
+            f"values{tuple(values.shape)} vs offsets[-1]={offsets[-1].item()}. It was most likely built with "
+            "torch.nested.as_nested_tensor(), whose ragged-dim inference collapses when every sample in the "
+            "group has the same sequence length. Build it with as_nested_tensor_ragged_last() instead."
+        )
+        position_ids._ragged_idx = 2
