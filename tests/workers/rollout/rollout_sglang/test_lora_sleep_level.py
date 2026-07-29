@@ -17,14 +17,20 @@
 Tests the branching logic that controls what gets released during sleep:
   - sleep_level=2 (merge path or no LoRA): release weights + kv_cache
   - sleep_level=1 (adapter path): release kv_cache only, keep base weights
+
+Also tests the sleep/wake_up pairing invariant: wake_up() must never ask the
+scheduler to resume a tag that sleep() did not release.
 """
 
 from __future__ import annotations
 
 import asyncio
+import types
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 # ---------------------------------------------------------------------------
 # Lightweight stubs so we can import SGLangHttpServer / ServerAdapter without
@@ -179,6 +185,120 @@ class TestSGLangHttpServerSleepTags:
     def test_adapter_mode_releases_kv_only(self):
         tags = self._run_sleep_logic(lora_as_adapter=True)
         assert tags == ["kv_cache"]
+
+
+# ---------------------------------------------------------------------------
+# sleep()/wake_up() pairing — regression test for the teacher-model crash
+# ---------------------------------------------------------------------------
+
+
+class _TagLedger:
+    """Stands in for the sglang Scheduler's offload-tag bookkeeping.
+
+    `offload_tags` starts empty (scheduler.py: `self.offload_tags = set()`),
+    release adds tags, resume removes them. The `.remove()` on a missing tag is
+    sglang's own line in scheduler_update_weights_mixin.resume_memory_occupation,
+    and it raises KeyError inside the scheduler subprocess — which SIGQUITs the
+    parent and takes the whole SGLangHttpServer ray actor down.
+    """
+
+    def __init__(self):
+        self.offload_tags: set[str] = set()
+        self.resume_requests: list[list[str]] = []
+        self.release_requests: list[list[str]] = []
+        self.flush_calls = 0
+
+    async def release_memory_occupation(self, obj, _):
+        self.release_requests.append(list(obj.tags))
+        for tag in obj.tags:
+            self.offload_tags.add(tag)
+
+    async def resume_memory_occupation(self, obj, _):
+        self.resume_requests.append(list(obj.tags))
+        for tag in obj.tags:
+            self.offload_tags.remove(tag)
+
+    async def flush_cache(self):
+        self.flush_calls += 1
+
+
+def _make_teacher_server(free_cache_engine: bool, rollout_mode):
+    """A stub bound to the REAL SGLangHttpServer.sleep / .wake_up methods."""
+    from verl.workers.rollout.sglang_rollout.async_sglang_server import SGLangHttpServer
+
+    ledger = _TagLedger()
+    stub = types.SimpleNamespace(
+        node_rank=0,
+        rollout_mode=rollout_mode,
+        config=_StubRolloutConfig(free_cache_engine=free_cache_engine),
+        model_config=_StubModelConfig(),
+        lora_as_adapter=False,
+        tokenizer_manager=ledger,
+    )
+    stub.sleep = SGLangHttpServer.sleep.__get__(stub, types.SimpleNamespace)
+    stub.wake_up = SGLangHttpServer.wake_up.__get__(stub, types.SimpleNamespace)
+    return stub, ledger
+
+
+class TestSleepWakeUpPairing:
+    """A teacher/reward replica is slept at construction and woken on first use.
+
+    With free_cache_engine=False, sleep() returns early and releases nothing, so
+    wake_up() must not issue a resume either. Before the guard was added, wake_up()
+    unconditionally asked to resume ["kv_cache", "weights"] and the scheduler died
+    with `KeyError: 'kv_cache'`.
+    """
+
+    @staticmethod
+    def _modes():
+        from verl.workers.rollout.replica import RolloutMode
+
+        return RolloutMode
+
+    @pytest.mark.parametrize("mode_name", ["COLOCATED", "STANDALONE"])
+    def test_no_resume_when_cache_engine_is_pinned(self, mode_name):
+        pytest.importorskip("sglang")
+        mode = getattr(self._modes(), mode_name)
+        server, ledger = _make_teacher_server(free_cache_engine=False, rollout_mode=mode)
+
+        async def seq():
+            await server.sleep()
+            await server.wake_up()
+
+        asyncio.run(seq())
+
+        assert ledger.release_requests == [], "sleep() must release nothing when the cache engine is pinned"
+        assert ledger.resume_requests == [], "wake_up() must not resume tags sleep() never released"
+        assert ledger.offload_tags == set()
+        assert ledger.flush_calls == 1, "the resident cache is still flushed on wake"
+
+    @pytest.mark.parametrize(
+        "mode_name,expected",
+        [("COLOCATED", ["kv_cache", "weights"]), ("STANDALONE", ["kv_cache"])],
+    )
+    def test_resume_matches_release_when_cache_engine_is_freed(self, mode_name, expected):
+        pytest.importorskip("sglang")
+        mode = getattr(self._modes(), mode_name)
+        server, ledger = _make_teacher_server(free_cache_engine=True, rollout_mode=mode)
+
+        async def seq():
+            await server.sleep()
+            assert ledger.offload_tags == set(expected)
+            await server.wake_up()
+
+        asyncio.run(seq())
+
+        assert ledger.release_requests == [expected]
+        assert ledger.resume_requests == [expected]
+        assert ledger.offload_tags == set(), "every released tag is resumed exactly once"
+
+    def test_hybrid_mode_still_rejects_wake_up(self):
+        pytest.importorskip("sglang")
+        mode = self._modes().HYBRID
+        server, _ = _make_teacher_server(free_cache_engine=False, rollout_mode=mode)
+
+        with pytest.raises(ValueError, match="wake_up not support"):
+            asyncio.run(server.wake_up())
 
 
 # ---------------------------------------------------------------------------

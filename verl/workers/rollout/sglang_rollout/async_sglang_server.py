@@ -310,16 +310,30 @@ class SGLangHttpServer:
         if self.rollout_mode == RolloutMode.HYBRID:
             # In hybrid mode, rollout is wake up in `update_weights`
             raise ValueError(f"wake_up not support rollout_mode {self.rollout_mode}")
-        elif self.rollout_mode == RolloutMode.COLOCATED:
-            # Directly call engine to wake up without sync weights.
-            obj = ResumeMemoryOccupationReqInput(tags=["kv_cache", "weights"])
+
+        # Resume only what sleep() released. sleep() returns immediately when
+        # free_cache_engine is False, so the engine still holds every tag it was
+        # born with and there is nothing to resume. Asking the scheduler to resume
+        # a tag it never offloaded reaches `self.offload_tags.remove(tag)` on a set
+        # that does not contain it (sglang scheduler_update_weights_mixin.py) and
+        # raises KeyError inside the scheduler subprocess; run_scheduler_process
+        # catches it and SIGQUITs its parent, so the whole SGLangHttpServer actor
+        # dies and Ray reports only an opaque SYSTEM_ERROR. The two halves of the
+        # sleep/resume protocol must be gated on the same condition.
+        if self.config.free_cache_engine:
+            if self.rollout_mode == RolloutMode.COLOCATED:
+                # Directly call engine to wake up without sync weights.
+                tags = ["kv_cache", "weights"]
+            else:
+                # In standalone mode, only kv_cache is released.
+                tags = ["kv_cache"]
+            obj = ResumeMemoryOccupationReqInput(tags=tags)
             await self.tokenizer_manager.resume_memory_occupation(obj, None)
-            await self.tokenizer_manager.flush_cache()
-        elif self.rollout_mode == RolloutMode.STANDALONE:
-            # In standalone mode, resume kv_cache if free_cache_engine is enabled
-            obj = ResumeMemoryOccupationReqInput(tags=["kv_cache"])
-            await self.tokenizer_manager.resume_memory_occupation(obj, None)
-            await self.tokenizer_manager.flush_cache()
+
+        # Unconditional: a resident cache still has to be dropped on wake-up, or a
+        # refreshed teacher (self-distillation / EMA) would serve prefixes cached
+        # under its previous weights.
+        await self.tokenizer_manager.flush_cache()
 
     @property
     def lora_as_adapter(self) -> bool:
