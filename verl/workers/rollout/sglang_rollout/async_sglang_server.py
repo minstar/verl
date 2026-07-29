@@ -17,6 +17,7 @@ import dataclasses
 import json
 import logging
 import os
+import socket
 from typing import Any, Optional
 
 import ray
@@ -43,7 +44,7 @@ from sglang.srt.managers.tokenizer_manager import ServerStatus
 
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_visible_devices_keyword
-from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
+from verl.utils.net_utils import get_free_port, is_valid_ipv6_address, reserve_static_port
 from verl.utils.profiler import DistProfiler, build_sglang_profiler_args
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
@@ -55,6 +56,11 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 visible_devices_keyword = get_visible_devices_keyword()
+
+# Port slots each role gets for its NCCL/TCPStore port, so a policy replica and a
+# teacher replica of the same rank never start their scan on the same port. Sized
+# well past any plausible replica count; see SGLangHttpServer._nccl_port_slot.
+_ROLE_SLOT_SPAN = 512
 
 
 class SGLangHttpServer:
@@ -150,6 +156,29 @@ class SGLangHttpServer:
         assert self._server_port is not None, "http server is not launched, port is None"
         return self._server_address, self._server_port
 
+    def _nccl_port_slot(self) -> int:
+        """A starting port slot unique to this server within the job.
+
+        The manager already names every server uniquely by role and rank, so the
+        role is read back from the actor name rather than widening the constructor
+        signature. Two servers in one job therefore never start their scan on the
+        same port; two servers in different jobs may, and the scan steps past.
+        """
+        try:
+            name = ray.get_runtime_context().get_actor_name() or ""
+        except Exception:  # not running inside a named actor, e.g. under test
+            name = ""
+
+        if "_teacher_" in name:
+            role = 1
+        elif "_reward_" in name:
+            role = 2
+        else:
+            role = 0
+
+        rank = self.replica_rank * max(self.nnodes, 1) + self.node_rank
+        return role * _ROLE_SLOT_SPAN + rank % _ROLE_SLOT_SPAN
+
     async def launch_server(self, master_address: str = None, master_port: int = None):
         if self.nnodes > 1:
             if self.node_rank != 0:
@@ -212,6 +241,23 @@ class SGLangHttpServer:
                     "lora_target_modules": self.model_config.target_modules,
                 }
             )
+        # Hand SGLang the NCCL/TCPStore port instead of letting it pick one.
+        # PortArgs.init_new falls back to bind(0)-then-close, which returns a port
+        # nobody owns until the scheduler subprocess binds it several seconds later,
+        # after it has spawned and imported torch. Every rollout replica draws inside
+        # that window -- and under self-distillation the teacher servers draw too --
+        # so two of them are handed the same number and whichever binds second dies
+        # with EADDRINUSE, taking its ray actor down as an opaque SYSTEM_ERROR.
+        # A slot below the ephemeral range cannot be drawn by anyone else, and the
+        # per-server slot below keeps replicas from colliding with each other.
+        # An explicit engine_kwargs.sglang.nccl_port still wins.
+        nccl_sock = None
+        if args.get("nccl_port") is None:
+            args["nccl_port"], nccl_sock = reserve_static_port(
+                self._nccl_port_slot(),
+                socket.AF_INET6 if is_valid_ipv6_address(self._server_address) else socket.AF_INET,
+            )
+
         # Only set dist_init_addr for multi-node; for single-node, let SGLang
         # handle port selection internally via nccl_port to avoid conflicts.
         if self.nnodes > 1:
@@ -263,6 +309,12 @@ class SGLangHttpServer:
         sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
         server_args = ServerArgs(**args)
+
+        # Release the NCCL port reservation only now. The subprocess launched just
+        # below is what binds it, and holding the reservation across that bind would
+        # make the port look taken to its intended owner.
+        if nccl_sock is not None:
+            nccl_sock.close()
         if version.parse(sglang.__version__) >= version.parse("0.5.7"):
             self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
                 server_args=server_args,
