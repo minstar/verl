@@ -339,3 +339,77 @@ class Qwen3XMLToolParser(ToolParser):
         except Exception as e:
             logger.exception(f"Error in extracting tool call from response: {e}")
             return text, []
+
+
+@ToolParser.register("glm4")
+class Glm4ToolParser(ToolParser):
+    """Tool calls as GLM-4-0414 actually emits them: a bare function name on one
+    line, its arguments as JSON on the following lines.
+
+    GLM-4 has no ``<tool_call>`` marker of any kind. Its chat template renders the
+    tool catalogue as a plain system section and instructs the model, in Chinese,
+    to express the arguments as JSON ("在调用上述函数时，请使用 Json 格式表示调用的参数").
+    Running it under the hermes parser therefore parses nothing at all: observed on
+    a real rollout, the model emitted
+
+        search_pubmed
+        {"query": "lisinopril spironolactone interaction severity"}
+
+    and the trainer recorded ``tool_call=False``, so the turn produced no
+    observation, the trajectory collapsed to a single newline, and training died a
+    few samples later on the empty response.
+
+    Only names present in ``tools`` are accepted. Without that check any assistant
+    turn whose first line happens to be one word followed by a JSON object -- an
+    ordinary way to answer a question about JSON -- would be executed as a call.
+    """
+
+    def __init__(self, tokenizer) -> None:
+        super().__init__(tokenizer)
+        # A candidate is: a line holding nothing but an identifier, then a JSON
+        # object starting on a later line. DOTALL so the object may span lines.
+        self.call_regex = regex.compile(
+            r"^[ \t]*([A-Za-z_][A-Za-z0-9_.-]*)[ \t]*\r?\n[ \t]*(\{.*?\})[ \t]*(?=\r?\n[ \t]*[A-Za-z_]|\r?\n[ \t]*$|$)",
+            regex.DOTALL | regex.MULTILINE,
+        )
+
+    @rollout_trace_op
+    async def extract_tool_calls(
+        self, responses_ids: list[int], tools: list[OpenAIFunctionToolSchema] = None
+    ) -> tuple[str, list[FunctionCall]]:
+        loop = get_event_loop()
+        text = await loop.run_in_executor(None, self.tokenizer.decode, responses_ids)
+
+        known = set()
+        for tool in tools or []:
+            fn = getattr(tool, "function", None)
+            name = getattr(fn, "name", None) if fn is not None else None
+            if name is None and isinstance(tool, dict):
+                name = (tool.get("function") or {}).get("name")
+            if name:
+                known.add(name)
+
+        function_calls, spans = [], []
+        for match in self.call_regex.finditer(text):
+            name, payload = match.group(1), match.group(2)
+            if known and name not in known:
+                continue
+            try:
+                arguments = json.loads(payload)
+            except Exception as e:
+                logger.error(f"Failed to decode glm4 tool call arguments for {name!r}: {e}")
+                continue
+            if not isinstance(arguments, dict):
+                continue
+            function_calls.append(FunctionCall(name=name, arguments=json.dumps(arguments, ensure_ascii=False)))
+            spans.append(match.span())
+
+        # Content is whatever was not consumed by a call, so a model that reasons
+        # before calling keeps its reasoning.
+        content, last = [], 0
+        for start, end in spans:
+            content.append(text[last:start])
+            last = end
+        content.append(text[last:])
+
+        return "".join(content), function_calls

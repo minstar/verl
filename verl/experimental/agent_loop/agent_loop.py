@@ -391,6 +391,25 @@ https://hydra.cc/docs/advanced/instantiate_objects/overview/
 _agent_loop_registry: dict[str, dict] = {}
 
 
+def _pad_empty_to_tensor(padded, length: int, attention_mask: bool) -> None:
+    """Repair `tokenizer.pad`'s output when it was handed an empty sequence.
+
+    `pad(..., return_tensors="pt")` normally returns tensors, but for an empty
+    input it returns the input object unchanged -- a list -- so every caller that
+    goes on to call `.dim()` raises AttributeError instead of seeing a padded
+    row. Rewrites those entries in place as zero rows of the requested length,
+    which is what padding an empty sequence to `max_length` should have produced.
+    """
+    ids = padded.get("input_ids")
+    if torch.is_tensor(ids) and ids.numel() > 0:
+        return
+    if torch.is_tensor(ids) or len(ids) > 0:
+        return
+    padded["input_ids"] = torch.zeros(length, dtype=torch.long)
+    if attention_mask:
+        padded["attention_mask"] = torch.zeros(length, dtype=torch.long)
+
+
 def register(agent_name: str):
     """Register agent loop class."""
 
@@ -668,6 +687,13 @@ class AgentLoopWorker:
             return_tensors="pt",
             return_attention_mask=True,
         )
+        # `tokenizer.pad` returns the input UNCHANGED -- a plain list -- when the
+        # sequence is empty, instead of a zero-length tensor, so `.dim()` below
+        # raises AttributeError on a rollout that produced no response tokens.
+        # That is reachable whenever a model's tool calls do not parse: the turn
+        # yields no observation, the trajectory collapses, and one empty sample
+        # takes the whole run down. Seen on GLM-4 under the hermes parser.
+        _pad_empty_to_tensor(response_output, self.rollout_config.response_length, attention_mask=True)
         if response_output["input_ids"].dim() == 1:
             response_output["input_ids"] = response_output["input_ids"].unsqueeze(0)
             response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
@@ -679,6 +705,7 @@ class AgentLoopWorker:
             return_tensors="pt",
             return_attention_mask=False,
         )
+        _pad_empty_to_tensor(response_mask_output, self.rollout_config.response_length, attention_mask=False)
         if response_mask_output["input_ids"].dim() == 1:
             response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
 
