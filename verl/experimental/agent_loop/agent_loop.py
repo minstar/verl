@@ -461,6 +461,23 @@ class AgentLoopWorker:
             self.distillation_loss_config: DistillationLossConfig = self.distillation_config.distillation_loss
             self.stream_teacher_with_rollout = self.distillation_config.teacher_model.enable_resource_pool
 
+            # Whether the teacher engine has to be woken around each rollout. This
+            # is NOT the same question as stream_teacher_with_rollout, which also
+            # selects how teacher logprobs are obtained and must not be flipped.
+            #
+            # sleep() returns immediately when free_cache_engine is False, releasing
+            # nothing, while wake_up() still issues flush_cache() to an engine that
+            # was never slept and then awaits a reply that never arrives. The run
+            # then stops inside _validate before one sample is dispatched: the
+            # trainer sits in generate_sequences, the agent-loop workers never
+            # receive a task, and every sglang server is idle. Observed on the
+            # TT-OPD arm, four hours to the wall with no log line after startup
+            # (job 61137; stacks captured in 61583). Both halves of a sleep/wake
+            # protocol have to be gated on the same condition.
+            self._teacher_needs_wake = self.stream_teacher_with_rollout and getattr(
+                self.distillation_config.teacher_model.inference, "free_cache_engine", True
+            )
+
             if self.stream_teacher_with_rollout:
                 if teacher_servers is None:
                     raise ValueError("Distillation streaming is enabled but no teacher servers were provided.")
@@ -485,6 +502,7 @@ class AgentLoopWorker:
                 self.teacher_server_manager = None
         else:
             self.stream_teacher_with_rollout = False
+            self._teacher_needs_wake = False
 
         # Privileged-injection accounting for the streaming teacher path, so a run log
         # can be grepped for whether hints actually fired. See _log_injection.
@@ -1257,7 +1275,7 @@ class AgentLoopManager:
         Returns:
             DataProto: Output batch.
         """
-        if self.stream_teacher_with_rollout:
+        if self._teacher_needs_wake:
             await self.teacher_model_manager.wake_up()
         chunkes = prompts.chunk(len(self.agent_loop_workers))
         outputs = await asyncio.gather(
@@ -1266,7 +1284,7 @@ class AgentLoopManager:
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
             ]
         )
-        if self.stream_teacher_with_rollout:
+        if self._teacher_needs_wake:
             await self.teacher_model_manager.sleep()
         output = DataProto.concat(outputs)
 
