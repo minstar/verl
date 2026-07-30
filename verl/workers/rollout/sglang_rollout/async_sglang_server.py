@@ -57,6 +57,65 @@ logger.setLevel(logging.INFO)
 
 visible_devices_keyword = get_visible_devices_keyword()
 
+
+def prompt_logprobs_from_meta(meta_info: dict, num_logprobs: int, prompt_len: int) -> tuple[list, list]:
+    """Rebuild vLLM's ``prompt_logprobs`` / ``prompt_ids`` layout from sglang's meta_info.
+
+    ``prompt_logprobs`` is a vLLM SamplingParams field and sglang has no such
+    argument, so the distillation teacher -- which asks for it on every call --
+    cannot run against an sglang server at all. sglang does return input
+    logprobs, under different names and a different shape, so the translation
+    belongs here in the engine-specific layer rather than in the teacher, which
+    should not know which engine is serving it.
+
+    The consumer (teacher_manager) asserts one row per prompt token and reads
+    them as ``(S, 1 or K)``, so the vLLM layout is reproduced exactly:
+
+      row i, for i < prompt_len-1 : the logprobs for token i+1, ordered by rank
+      row prompt_len-1            : a dummy, because the last prompt token has
+                                    no successor to predict
+
+    An off-by-one here would not crash; it would shift every teacher logprob by
+    one position and silently corrupt the KL. Hence the explicit length check
+    rather than a slice that always "works".
+    """
+    width = max(num_logprobs, 1)
+
+    if num_logprobs > 0:
+        rows = meta_info.get("input_top_logprobs") or []
+    else:
+        rows = meta_info.get("input_token_logprobs") or []
+        rows = [[entry] for entry in rows]
+
+    # sglang may or may not emit a leading placeholder for the first token, which
+    # has no predecessor and therefore no logprob. Drop it if present.
+    if rows and rows[0] and rows[0][0] is not None and rows[0][0][0] is None:
+        rows = rows[1:]
+    elif len(rows) == prompt_len:
+        rows = rows[1:]
+
+    if len(rows) != prompt_len - 1:
+        raise ValueError(
+            f"sglang returned {len(rows)} input-logprob rows for a {prompt_len}-token prompt; "
+            f"expected {prompt_len - 1}. Refusing to guess the alignment: a shift here "
+            f"silently corrupts every teacher logprob."
+        )
+
+    logprobs_ls, ids_ls = [], []
+    for row in rows:
+        # Each entry is (logprob, token_id, text) as sglang emits it.
+        vals = [float(e[0]) for e in row][:width]
+        ids = [int(e[1]) for e in row][:width]
+        # A position may carry fewer than K candidates; pad so the tensor is square.
+        vals += [0.0] * (width - len(vals))
+        ids += [0] * (width - len(ids))
+        logprobs_ls.append(vals)
+        ids_ls.append(ids)
+
+    logprobs_ls.append([0.0] * width)
+    ids_ls.append([0] * width)
+    return logprobs_ls, ids_ls
+
 # Port slots each role gets for its NCCL/TCPStore port, so a policy replica and a
 # teacher replica of the same rank never start their scan on the same port. Sized
 # well past any plausible replica count; see SGLangHttpServer._nccl_port_slot.
@@ -459,15 +518,25 @@ class SGLangHttpServer:
         sampling_params["max_new_tokens"] = max_new_tokens
         return_logprob = sampling_params.pop("logprobs", False)
 
+        # vLLM spells "give me the logprobs of the INPUT tokens" as a sampling
+        # param; sglang spells it as three request fields. The distillation
+        # teacher only knows the vLLM spelling, so translate it here.
+        prompt_logprobs_k = sampling_params.pop("prompt_logprobs", None)
+
         request = {
             "rid": request_id,
             "input_ids": prompt_ids,
             "sampling_params": sampling_params,
-            "return_logprob": return_logprob,
+            "return_logprob": bool(return_logprob) or prompt_logprobs_k is not None,
             "image_data": image_data,
             # TODO: support video input for sglang
             # video_data=video_data,
         }
+
+        if prompt_logprobs_k is not None:
+            request["logprob_start_len"] = 0
+            if prompt_logprobs_k > 0:
+                request["top_logprobs_num"] = prompt_logprobs_k
 
         if self.config.enable_rollout_routing_replay:
             request.update({"return_routed_experts": True})
@@ -508,12 +577,20 @@ class SGLangHttpServer:
                     -1, hf_config.num_hidden_layers, hf_config.num_experts_per_tok
                 )
 
+        extra_fields = {"global_steps": self.global_steps}
+        if prompt_logprobs_k is not None:
+            prompt_logprobs, prompt_token_ids = prompt_logprobs_from_meta(
+                output["meta_info"], prompt_logprobs_k, len(prompt_ids)
+            )
+            extra_fields["prompt_logprobs"] = prompt_logprobs
+            extra_fields["prompt_ids"] = prompt_token_ids
+
         return TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
             routed_experts=routed_experts,
             stop_reason=finish_reason,
-            extra_fields={"global_steps": self.global_steps},
+            extra_fields=extra_fields,
         )
 
     async def set_global_steps(self, global_steps: int):
