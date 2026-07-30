@@ -461,22 +461,6 @@ class AgentLoopWorker:
             self.distillation_loss_config: DistillationLossConfig = self.distillation_config.distillation_loss
             self.stream_teacher_with_rollout = self.distillation_config.teacher_model.enable_resource_pool
 
-            # Whether the teacher engine has to be woken around each rollout. This
-            # is NOT the same question as stream_teacher_with_rollout, which also
-            # selects how teacher logprobs are obtained and must not be flipped.
-            #
-            # sleep() returns immediately when free_cache_engine is False, releasing
-            # nothing, while wake_up() still issues flush_cache() to an engine that
-            # was never slept and then awaits a reply that never arrives. The run
-            # then stops inside _validate before one sample is dispatched: the
-            # trainer sits in generate_sequences, the agent-loop workers never
-            # receive a task, and every sglang server is idle. Observed on the
-            # TT-OPD arm, four hours to the wall with no log line after startup
-            # (job 61137; stacks captured in 61583). Both halves of a sleep/wake
-            # protocol have to be gated on the same condition.
-            self._teacher_needs_wake = self.stream_teacher_with_rollout and getattr(
-                self.distillation_config.teacher_model.inference, "free_cache_engine", True
-            )
 
             if self.stream_teacher_with_rollout:
                 if teacher_servers is None:
@@ -502,7 +486,6 @@ class AgentLoopWorker:
                 self.teacher_server_manager = None
         else:
             self.stream_teacher_with_rollout = False
-            self._teacher_needs_wake = False
 
         # Privileged-injection accounting for the streaming teacher path, so a run log
         # can be grepped for whether hints actually fired. See _log_injection.
@@ -1145,6 +1128,22 @@ class AgentLoopManager:
         self.distillation_enabled = is_distillation_enabled(self.config.get("distillation", None))
         self.stream_teacher_with_rollout = (
             self.distillation_enabled and self.config.distillation.teacher_model.enable_resource_pool
+        )
+        # Whether the teacher engine has to be woken around each rollout. NOT the
+        # same question as stream_teacher_with_rollout, which also selects how
+        # teacher logprobs are obtained and must not be flipped to fix a hang.
+        #
+        # sleep() returns immediately when free_cache_engine is False, releasing
+        # nothing, while wake_up() still issues flush_cache() to an engine that was
+        # never slept and then awaits a reply that never arrives. The run stops
+        # inside _validate before one sample is dispatched: the trainer sits in
+        # generate_sequences, the agent-loop workers never receive a task, and
+        # every sglang server is idle. Observed on the TT-OPD arm (job 61137, four
+        # hours to the wall; stacks captured in 61583).
+        self._teacher_needs_wake = self.stream_teacher_with_rollout and bool(
+            self.config.distillation.teacher_model.inference.get("free_cache_engine", True)
+            if hasattr(self.config.distillation.teacher_model.inference, "get")
+            else getattr(self.config.distillation.teacher_model.inference, "free_cache_engine", True)
         )
 
         assert worker_group is not None or self.rollout_config.nnodes > 0, "nnodes must be > 0 in standalone mode"

@@ -95,10 +95,30 @@ def test_both_halves_share_one_condition():
     assert len(gated) == 2, f"expected wake and sleep each gated once, found {len(gated)}"
 
 
-def test_flag_is_defined_on_every_construction_path():
-    """Both the distillation and non-distillation branches must set it."""
+def _class_body(name: str) -> str:
     src = _source()
-    assert src.count("self._teacher_needs_wake = ") == 2, (
-        "one branch of __init__ leaves _teacher_needs_wake undefined, which turns "
-        "the hang into an AttributeError at the first rollout"
-    )
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.ClassDef) and node.name == name:
+            return ast.get_source_segment(src, node)
+    raise AssertionError(f"class {name} not found")
+
+
+def test_the_class_that_uses_the_flag_also_sets_it():
+    """Counting file-wide is what let the first attempt through.
+
+    The flag was set on AgentLoopWorker and read on AgentLoopManager, so a
+    file-wide count of two assignments passed while the manager raised
+    `AttributeError: 'AgentLoopManager' object has no attribute
+    '_teacher_needs_wake'` at the first rollout (job 61860). Ask the question per
+    class instead.
+    """
+    for name in ("AgentLoopManager", "AgentLoopWorker"):
+        body = _class_body(name)
+        sets = body.count("self._teacher_needs_wake = ")
+        uses = body.count("self._teacher_needs_wake") - sets
+        assert uses == 0 or sets >= 1, (
+            f"{name} reads _teacher_needs_wake {uses}x but never assigns it"
+        )
+        assert sets == 0 or uses >= 1, (
+            f"{name} assigns _teacher_needs_wake {sets}x but never reads it -- dead state"
+        )
