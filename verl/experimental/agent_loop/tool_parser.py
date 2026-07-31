@@ -389,10 +389,22 @@ class Glm4ToolParser(ToolParser):
             if name:
                 known.add(name)
 
+        # Spans inside a CLOSED ``` fence are a demonstration, not an intent. A model
+        # that writes "you would call it like this:" followed by a fenced example
+        # otherwise has that example executed, and `submit_answer` is in the tool
+        # set -- an illustrative submit ends the episode on an illustrative answer.
+        # Only closed fences count, so an unterminated one cannot swallow the rest
+        # of the turn. The cost is that a genuine call written inside a fence is
+        # missed; that loses a turn, where the other direction corrupts the episode.
+        fenced = [m.span() for m in regex.finditer(r"```.*?```", text, regex.DOTALL)]
+
         function_calls, spans = [], []
         for match in self.call_regex.finditer(text):
             name, payload = match.group(1), match.group(2)
             if known and name not in known:
+                continue
+            start = match.start()
+            if any(lo <= start < hi for lo, hi in fenced):
                 continue
             try:
                 arguments = json.loads(payload)

@@ -120,3 +120,42 @@ def test_hermes_parses_nothing_from_glm_output():
 def test_empty_response_yields_no_calls(parser):
     _, calls = _extract(parser, "")
     assert calls == []
+
+def test_a_call_inside_a_closed_fence_is_a_demonstration_not_an_intent():
+    """A model showing HOW to call a tool must not have that example executed.
+
+    submit_answer is in the tool set, so an illustrative submit would end the
+    episode on an illustrative answer.
+    """
+    _, calls = _extract("glm4", '```\nsubmit_answer\n{"answer": "X"}\n```')
+    assert calls == []
+
+
+def test_a_language_tagged_fence_counts_too():
+    _, calls = _extract("glm4", '```json\nsearch_evidence\n{"query": "x"}\n```')
+    assert calls == []
+
+
+def test_a_real_call_after_a_fenced_demonstration_still_fires():
+    _, calls = _extract(
+        "glm4",
+        '```\nsubmit_answer\n{"answer": "X"}\n```\nsearch_evidence\n{"query": "y"}',
+    )
+    assert calls == [("search_evidence", {"query": "y"})]
+
+
+def test_an_unterminated_fence_does_not_swallow_the_rest_of_the_turn():
+    """Only CLOSED fences suppress; otherwise one stray ``` disables tool use."""
+    _, calls = _extract("glm4", '```\nsearch_evidence\n{"query": "x"}')
+    assert calls == [("search_evidence", {"query": "x"})]
+
+
+def test_crlf_line_endings_are_accepted():
+    _, calls = _extract("glm4", 'search_evidence\r\n{"query": "sepsis"}')
+    assert calls == [("search_evidence", {"query": "sepsis"})]
+
+
+def test_nested_braces_in_the_arguments():
+    _, calls = _extract("glm4", 'search_evidence\n{"q": {"a": 1, "b": [2, 3]}}')
+    assert calls == [("search_evidence", {"q": {"a": 1, "b": [2, 3]}})]
+
