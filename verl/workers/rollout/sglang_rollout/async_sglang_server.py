@@ -102,13 +102,20 @@ def prompt_logprobs_from_meta(meta_info: dict, num_logprobs: int, prompt_len: in
         )
 
     logprobs_ls, ids_ls = [], []
-    for row in rows:
+    for i, row in enumerate(rows):
         # Each entry is (logprob, token_id, text) as sglang emits it.
         vals = [float(e[0]) for e in row][:width]
         ids = [int(e[1]) for e in row][:width]
-        # A position may carry fewer than K candidates; pad so the tensor is square.
-        vals += [0.0] * (width - len(vals))
-        ids += [0] * (width - len(ids))
+        if len(vals) != width:
+            # Deliberately NOT padded. 0.0 is log(1), i.e. certainty -- the largest
+            # value a logprob can take -- so padding a short row with it would put
+            # maximum mass on a filler token in the middle of the distillation KL,
+            # and produce a perfectly shaped tensor that trains on nonsense. vLLM's
+            # own reader asserts the width instead of padding; match that.
+            raise ValueError(
+                f"sglang returned {len(vals)} candidates at prompt position {i}, expected {width}. "
+                f"Padding this would inject log(1) certainty on a filler token into the KL."
+            )
         logprobs_ls.append(vals)
         ids_ls.append(ids)
 

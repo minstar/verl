@@ -85,12 +85,23 @@ def test_topk_rows_keep_rank_order_and_width():
     assert lp[-1] == [0.0, 0.0] and ids[-1] == [0, 0]
 
 
-def test_a_short_row_is_padded_so_the_tensor_stays_square():
+def test_a_short_row_raises_rather_than_being_padded():
+    """0.0 is log(1) -- certainty -- so padding with it is not a neutral filler.
+
+    An earlier version padded short rows to keep the tensor square. That put the
+    largest value a logprob can take on a filler token, mid-sequence, inside the
+    distillation KL, and produced a correctly shaped tensor that trains on
+    nonsense. vLLM's own reader asserts the width; so does this.
+    """
     rows = [[entry(-0.1, 11)], [entry(-0.2, 12), entry(-1.2, 92)], [entry(-0.3, 13)]]
-    lp, ids = prompt_logprobs_from_meta(meta_topk(rows), 2, prompt_len=4)
-    assert all(len(r) == 2 for r in lp)
-    assert all(len(r) == 2 for r in ids)
-    assert lp[0] == [-0.1, 0.0] and ids[0] == [11, 0]
+    with pytest.raises(ValueError, match="certainty"):
+        prompt_logprobs_from_meta(meta_topk(rows), 2, prompt_len=4)
+
+
+def test_the_short_row_error_names_the_position():
+    rows = [[entry(-0.1, 11), entry(-1.1, 91)], [entry(-0.2, 12)], [entry(-0.3, 13), entry(-1.3, 93)]]
+    with pytest.raises(ValueError, match="position 1"):
+        prompt_logprobs_from_meta(meta_topk(rows), 2, prompt_len=4)
 
 
 @pytest.mark.parametrize("n_rows", [0, 1, 2, 5, 10])
