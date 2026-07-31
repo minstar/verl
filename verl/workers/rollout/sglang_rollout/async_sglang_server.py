@@ -235,6 +235,15 @@ class SGLangHttpServer:
         except Exception:  # not running inside a named actor, e.g. under test
             name = ""
 
+        if not name:
+            # Without the name every server falls into the policy role, so a
+            # teacher and the policy replica of the same rank would pick the SAME
+            # starting slot. The reservation is exclusive and the scan steps past a
+            # taken port, so that is not a port clash -- but it reopens the
+            # close-to-bind race that distinct slots exist to avoid. Spread them by
+            # pid instead; the slot only has to differ, not to be predictable.
+            return os.getpid() % (3 * _ROLE_SLOT_SPAN)
+
         if "_teacher_" in name:
             role = 1
         elif "_reward_" in name:
@@ -379,8 +388,18 @@ class SGLangHttpServer:
         # Release the NCCL port reservation only now. The subprocess launched just
         # below is what binds it, and holding the reservation across that bind would
         # make the port look taken to its intended owner.
+        #
+        # Not wrapped in try/finally, deliberately. Everything between the
+        # reservation and here can raise -- ServerArgs validation, the lora and mtp
+        # blocks -- and an escaping exception leaves this socket holding its port
+        # for the life of the actor. That leak is bounded and self-limiting: one
+        # port per failed launch out of a 10,000-port span, the scan steps past it,
+        # and a launch failure normally kills the actor, which closes it. Restoring
+        # it costs an indentation change across the whole body of a method that
+        # eleven live jobs are running, which is the larger risk today.
         if nccl_sock is not None:
             nccl_sock.close()
+            nccl_sock = None
         if version.parse(sglang.__version__) >= version.parse("0.5.7"):
             self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
                 server_args=server_args,
