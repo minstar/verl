@@ -56,6 +56,22 @@ def compute_forward_kl_topk(
     teacher_topk_log_probs = teacher_topk_log_probs.values().unsqueeze(0)  # (1, total_nnz, topk)
     teacher_topk_ids = teacher_topk_ids.values().unsqueeze(0)  # (1, total_nnz, topk)
 
+    # Restore the candidate axis that the transport had to drop.
+    #
+    # verl nests per-sample tensors with the ragged dim LAST, so a single-candidate
+    # teacher signal travels as (bsz, ragged) rather than (bsz, ragged, 1) -- keeping
+    # the trailing 1 would put the ragged sequence dim in the middle and kill the
+    # batch chunk. See _to_ragged_last in verl/experimental/teacher_loop/teacher_manager.py.
+    # After .values().unsqueeze(0) above, that arrives here as (1, total_nnz), and
+    # everything below needs a candidate axis to gather over and then sum away.
+    if teacher_topk_log_probs.dim() == 2:
+        teacher_topk_log_probs = teacher_topk_log_probs.unsqueeze(-1)
+        teacher_topk_ids = teacher_topk_ids.unsqueeze(-1)
+    assert teacher_topk_log_probs.shape == teacher_topk_ids.shape, (
+        f"teacher logprobs {tuple(teacher_topk_log_probs.shape)} and ids "
+        f"{tuple(teacher_topk_ids.shape)} must agree after restoring the candidate axis"
+    )
+
     # 1. split across sp groups (bsz, seqlen, topk) => (bsz, seqlen/sp_size, topk)
     if get_ulysses_sequence_parallel_world_size() > 1:
         teacher_topk_log_probs = slice_input_tensor(teacher_topk_log_probs, dim=1)

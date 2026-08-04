@@ -328,6 +328,56 @@ def _get_teacher_sampling_params(
     }
 
 
+def _to_ragged_last(
+    teacher_ids: torch.Tensor,
+    teacher_logprobs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Drop the candidate axis when there is exactly one candidate per position.
+
+    The teacher server returns (S, C): one row per sequence position, C candidates
+    wide. C is `prompt_logprobs` from _get_teacher_sampling_params, which is 0 --
+    meaning "the actual token only", i.e. C == 1 -- unless top-k distillation is
+    enabled.
+
+    That layout cannot survive the trip to the loss. verl transports per-sample
+    tensors as nested tensors and requires the RAGGED dim to be LAST
+    (verl.utils.tensordict_utils.as_nested_tensor_ragged_last). Here the ragged
+    dim is the sequence, and it sits FIRST, so the moment two samples in a batch
+    have different lengths -- i.e. essentially always -- chunking the batch dies
+    with
+
+        AssertionError: only the last (ragged) dim may vary across samples.
+        Got torch.Size([12771, 1]) vs torch.Size([12662, 1])
+
+    raised from _compute_old_log_prob, which names neither this tensor nor this
+    module. That is why no distillation arm has ever reached its first optimizer
+    step on any backbone.
+
+    With C == 1 the axis carries nothing, so dropping it here makes the tensor
+    (S,), which pads to (1, S), batches to (bsz, S) and nests to (bsz, ragged) --
+    ragged last, as required. compute_forward_kl_topk puts the axis back before
+    gathering; see the matching note there.
+
+    With C > 1 the two requirements genuinely conflict: chunking wants the
+    sequence last, and the loss gathers over the candidate axis with dim=-1 so it
+    wants candidates last. No single 3-D layout satisfies both, and resolving it
+    means changing the transport on both sides. Refuse here, where the shape is
+    still explicable, rather than 11 minutes into a cluster job.
+    """
+    if teacher_logprobs.dim() <= 1:
+        return teacher_ids, teacher_logprobs
+    n_candidates = teacher_logprobs.shape[-1]
+    if n_candidates == 1:
+        return teacher_ids.squeeze(-1), teacher_logprobs.squeeze(-1)
+    raise NotImplementedError(
+        f"teacher logprobs came back {n_candidates} candidates wide, but the nested-tensor "
+        "transport requires the ragged (sequence) dim to be last, and the top-k loss gathers "
+        "over the candidate dim with dim=-1. Both cannot be last. Top-k distillation needs the "
+        "transport layout changed on both sides before it can run; single-candidate "
+        "distillation (prompt_logprobs=0) works today."
+    )
+
+
 def _pad_teacher_outputs(
     teacher_ids: torch.Tensor,
     teacher_logprobs: torch.Tensor,
@@ -478,7 +528,7 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
                     target_len=len(sequence_ids),
                 )
 
-            return teacher_ids, teacher_logprobs
+            return _to_ragged_last(teacher_ids, teacher_logprobs)
 
         # Standard path (no hints)
         teacher_output = await self.generate(
@@ -493,7 +543,7 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
         teacher_ids = torch.tensor(teacher_output.extra_fields["prompt_ids"], dtype=torch.int32)
         teacher_logprobs = torch.tensor(teacher_output.extra_fields["prompt_logprobs"])
         assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)
-        return teacher_ids, teacher_logprobs
+        return _to_ragged_last(teacher_ids, teacher_logprobs)
 
     def _build_hint_tokens(self, is_correct: bool, tokenizer=None) -> Optional[list[int]]:
         """Build hint token IDs for injection into teacher sequence.
