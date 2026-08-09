@@ -32,6 +32,51 @@ from tqdm import tqdm
 from .base_model_merger import BaseModelMerger
 
 
+def _load_reference_dtypes(ref_dir: str) -> dict[str, torch.dtype]:
+    """Map parameter name -> dtype, read from a reference model's safetensors.
+
+    Only the headers are read, never the tensor data, so this costs a few
+    milliseconds regardless of model size.
+
+    A reference that cannot be read yields an empty map, which restores the old
+    all-bf16 behaviour rather than failing the merge -- the caller may legitimately
+    have no reference, and a merge that dies here would be a worse outcome than
+    one that produces the same file it always did.
+    """
+    if not ref_dir:
+        return {}
+    files = sorted(Path(ref_dir).glob("*.safetensors"))
+    if not files:
+        print(f"[merger] DTYPE_REFERENCE={ref_dir} holds no safetensors; keeping bf16 for every key")
+        return {}
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        print("[merger] safetensors is unavailable; keeping bf16 for every key")
+        return {}
+
+    dtypes: dict[str, torch.dtype] = {}
+    name_to_torch = {
+        "F64": torch.float64, "F32": torch.float32, "F16": torch.float16,
+        "BF16": torch.bfloat16, "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2,
+    }
+    for f in files:
+        try:
+            with safe_open(f, framework="pt") as g:
+                for key in g.keys():
+                    dt = name_to_torch.get(g.get_slice(key).get_dtype())
+                    if dt is not None:
+                        dtypes[key] = dt
+        except Exception as e:  # noqa: BLE001
+            print(f"[merger] could not read dtypes from {f}: {type(e).__name__}: {e}")
+            return {}
+
+    non_bf16 = {k: v for k, v in dtypes.items() if v is not torch.bfloat16}
+    print(f"[merger] dtype reference {ref_dir}: {len(dtypes)} keys, "
+          f"{len(non_bf16)} not bf16{' -> ' + ', '.join(sorted(non_bf16)[:3]) + ' ...' if non_bf16 else ''}")
+    return dtypes
+
+
 class FSDPModelMerger(BaseModelMerger):
     """
     Model merger for FSDP (Fully Sharded Data Parallel) checkpoints.
@@ -156,6 +201,30 @@ class FSDPModelMerger(BaseModelMerger):
             for future in tqdm(futures, desc=f"Loading {total_shards} FSDP shards", total=total_shards):
                 future.result()
 
+        # Per-key output dtype. FSDP keeps master weights in fp32, so the shards
+        # are uniformly fp32 and carry no record of what the architecture wanted;
+        # casting the lot to bf16 is right for almost every key and wrong for the
+        # few a model deliberately keeps in fp32.
+        #
+        # Qwen3.5 is one of those. Its hybrid linear-attention path holds
+        # `linear_attn.A_log` and `linear_attn.norm.weight` in fp32 -- 48 tensors
+        # in the 4B release -- and sglang sizes the Mamba conv-state cache from
+        # them. Serve a bf16 merge and the kernel aborts on
+        #
+        #   RuntimeError: Expected conv_states_.scalar_type() == input_type
+        #                 to be true, but got false
+        #
+        # before a single token is produced. A_log is a log-decay parameter, so
+        # the rounding is not free either: bf16 leaves it 8 mantissa bits.
+        #
+        # DTYPE_REFERENCE names a model directory to copy dtypes from -- normally
+        # the backbone the run was trained from. Keys absent there keep bf16, so
+        # a checkpoint that grew a tensor the reference never had still merges.
+        dtype_ref = _load_reference_dtypes(os.environ.get("DTYPE_REFERENCE", ""))
+
+        def _cast(t: torch.Tensor, key: str) -> torch.Tensor:
+            return t.to(dtype_ref.get(key, torch.bfloat16))
+
         # Merge state dicts from all shards
         state_dict = {}
         param_placements: dict[str, list] = {}
@@ -166,7 +235,7 @@ class FSDPModelMerger(BaseModelMerger):
                 # add tensor shard in order of rank to state_dict[key]
                 tensor = model_state_shard.pop(key)
                 if isinstance(tensor, DTensor):
-                    state_dict[key].append(tensor._local_tensor.bfloat16())
+                    state_dict[key].append(_cast(tensor._local_tensor, key))
 
                     placements = tuple(tensor.placements)
                     # replicated placement at dp dimension can be discarded
@@ -178,7 +247,7 @@ class FSDPModelMerger(BaseModelMerger):
                     else:
                         assert param_placements[key] == placements
                 else:
-                    state_dict[key].append(tensor.bfloat16())
+                    state_dict[key].append(_cast(tensor, key))
 
         del model_state_dict_lst
 
