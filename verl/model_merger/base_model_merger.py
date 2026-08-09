@@ -16,6 +16,7 @@ import argparse
 import os
 import warnings
 from abc import ABC, abstractmethod
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -389,6 +390,36 @@ class BaseModelMerger(ABC):
         lora_path = self.save_lora_adapter(state_dict)
         if lora_path:
             print(f"Saving lora adapter to {lora_path}")
+
+        # Make config.json tell the truth about the weights it ships with.
+        #
+        # `from_config(..., torch_dtype=...)` above is a transformers-4 spelling;
+        # transformers 5 renamed the argument to `dtype`, so the bfloat16 request
+        # is silently dropped, the empty model is built float32, and
+        # save_pretrained records `dtype: "float32"` beside a state_dict that is
+        # bf16. The base release says `text_config.dtype: "bfloat16"`, and the
+        # difference is not cosmetic: sglang sizes the Qwen3.5 Mamba conv-state
+        # cache from the declared dtype, so a merged checkpoint loads and then
+        # dies in the kernel with
+        #
+        #   RuntimeError: Expected conv_states_.scalar_type() == input_type
+        #                 to be true, but got false
+        #
+        # Deriving the value from the state_dict rather than hardcoding bfloat16
+        # keeps this honest if the merge ever emits something else, and keeps it
+        # correct whichever spelling of the argument the installed transformers
+        # happens to use.
+        if state_dict:
+            dominant = Counter(t.dtype for t in state_dict.values()).most_common(1)[0][0]
+            for cfg in (model.config,
+                        getattr(model.config, "text_config", None),
+                        getattr(model.config, "vision_config", None)):
+                if cfg is None:
+                    continue
+                cfg.dtype = dominant
+                if hasattr(cfg, "torch_dtype"):
+                    cfg.torch_dtype = dominant
+            print(f"Declaring dtype={dominant} in config.json ({len(state_dict)} tensors)")
 
         print(f"Saving model to {self.config.target_dir}")
         model.save_pretrained(self.config.target_dir, state_dict=state_dict)
