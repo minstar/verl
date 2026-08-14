@@ -380,9 +380,55 @@ class BaseModelMerger(ABC):
 
     def save_hf_model_and_tokenizer(self, state_dict: dict[str, torch.Tensor]):
         auto_model_class = self.get_transformers_auto_model_class()
+
+        # Declare the dtype BEFORE the skeleton is built, not after.
+        #
+        # save_pretrained does `model_to_save.config.dtype = str(dtype).split(".")[1]`
+        # (transformers modeling_utils.py:3287) from the MODEL's dtype, so anything
+        # written onto the config afterwards is overwritten for the root key. A
+        # composite model also takes its dtype from `text_config`/`vision_config`
+        # rather than from the constructor argument, so passing `dtype=` alone
+        # leaves the skeleton fp32 — which is how a merged Qwen3.5 ended up
+        # declaring `float32` over bf16 weights while its sub-configs said
+        # `bfloat16`. That is not cosmetic: sglang sizes the Mamba conv-state cache
+        # from the declared dtype, and the checkpoint loads onto the GPU and then
+        # dies in causal_conv1d_fwd with
+        #
+        #   RuntimeError: Expected conv_states_.scalar_type() == input_type
+        #                 to be true, but got false
+        #
+        # The value comes from the state_dict actually being written, so it stays
+        # honest if the merge ever emits something else.
+        target_dtype = torch.bfloat16
+        if state_dict:
+            target_dtype = Counter(t.dtype for t in state_dict.values()).most_common(1)[0][0]
+        for cfg in (self.model_config,
+                    getattr(self.model_config, "text_config", None),
+                    getattr(self.model_config, "vision_config", None)):
+            if cfg is None:
+                continue
+            cfg.dtype = target_dtype
+            if hasattr(cfg, "torch_dtype"):
+                cfg.torch_dtype = target_dtype
+        print(f"Declaring dtype={target_dtype} in config.json ({len(state_dict)} tensors)")
+
         with init_empty_weights():
-            model = auto_model_class.from_config(
-                self.model_config, torch_dtype=torch.bfloat16, trust_remote_code=self.config.trust_remote_code
+            try:
+                # transformers 5 spelling; 4.x raises TypeError on the unknown kwarg.
+                model = auto_model_class.from_config(
+                    self.model_config, dtype=target_dtype, trust_remote_code=self.config.trust_remote_code
+                )
+            except TypeError:
+                model = auto_model_class.from_config(
+                    self.model_config, torch_dtype=target_dtype,
+                    trust_remote_code=self.config.trust_remote_code
+                )
+        if model.dtype != target_dtype:
+            # save_pretrained will write model.dtype, so a mismatch here is the
+            # bug this block exists to prevent, not a detail.
+            raise RuntimeError(
+                f"skeleton built as {model.dtype} but the weights are {target_dtype}; "
+                "config.json would misdeclare the dtype and the checkpoint would fail to serve"
             )
         model.to_empty(device="cpu")
         model = self.patch_model_generation_config(model)
@@ -390,36 +436,6 @@ class BaseModelMerger(ABC):
         lora_path = self.save_lora_adapter(state_dict)
         if lora_path:
             print(f"Saving lora adapter to {lora_path}")
-
-        # Make config.json tell the truth about the weights it ships with.
-        #
-        # `from_config(..., torch_dtype=...)` above is a transformers-4 spelling;
-        # transformers 5 renamed the argument to `dtype`, so the bfloat16 request
-        # is silently dropped, the empty model is built float32, and
-        # save_pretrained records `dtype: "float32"` beside a state_dict that is
-        # bf16. The base release says `text_config.dtype: "bfloat16"`, and the
-        # difference is not cosmetic: sglang sizes the Qwen3.5 Mamba conv-state
-        # cache from the declared dtype, so a merged checkpoint loads and then
-        # dies in the kernel with
-        #
-        #   RuntimeError: Expected conv_states_.scalar_type() == input_type
-        #                 to be true, but got false
-        #
-        # Deriving the value from the state_dict rather than hardcoding bfloat16
-        # keeps this honest if the merge ever emits something else, and keeps it
-        # correct whichever spelling of the argument the installed transformers
-        # happens to use.
-        if state_dict:
-            dominant = Counter(t.dtype for t in state_dict.values()).most_common(1)[0][0]
-            for cfg in (model.config,
-                        getattr(model.config, "text_config", None),
-                        getattr(model.config, "vision_config", None)):
-                if cfg is None:
-                    continue
-                cfg.dtype = dominant
-                if hasattr(cfg, "torch_dtype"):
-                    cfg.torch_dtype = dominant
-            print(f"Declaring dtype={dominant} in config.json ({len(state_dict)} tensors)")
 
         print(f"Saving model to {self.config.target_dir}")
         model.save_pretrained(self.config.target_dir, state_dict=state_dict)

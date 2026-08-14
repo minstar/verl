@@ -653,20 +653,32 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
         if _OPSD_GOLD_CONDITIONING or _HINT_OPD_ENABLED:
             print(f"[Teacher-batch] privileged injection over {len(data)} samples: " + format_injection_reasons(reasons))
 
-        # Use return_exceptions to avoid crashing the entire batch on a single failure
+        # Gather with return_exceptions so one bad sample does not tear down the
+        # other coroutines mid-flight, then FAIL on it. This used to substitute
+        # `torch.zeros(seq_len)` for a failed sample, which is not a neutral
+        # fallback: a logprob of 0.0 is log(1), i.e. the teacher asserting perfect
+        # certainty about every token it never actually scored. With
+        # `use_policy_gradient=True` the distillation loss becomes the advantage
+        # (`advantages=-distillation_losses.detach()`), so a fabricated zero turns
+        # into a large positive advantage and the failed trajectory is reinforced
+        # token-for-token regardless of its reward. Nothing counted it; a print
+        # into a Ray actor log was the only trace, and a batch that was entirely
+        # fallback still took an optimizer step.
+        #
+        # BaseException, not Exception: asyncio.CancelledError stopped deriving
+        # from Exception in 3.8, so a cancelled task slipped past the old check and
+        # died on the tuple unpack below with a bare TypeError.
         outputs_raw = await asyncio.gather(*tasks, return_exceptions=True)
-        outputs = []
-        for idx, result in enumerate(outputs_raw):
-            if isinstance(result, Exception):
-                # Failed sample — use zero logprobs as fallback
-                prompt_length, response_length = lengths[idx]
-                seq_len = prompt_length + response_length
-                fallback_ids = torch.zeros(seq_len, dtype=torch.int32)
-                fallback_logprobs = torch.zeros(seq_len)
-                outputs.append((fallback_ids, fallback_logprobs))
-                print(f"[Teacher] Sample {idx} failed: {type(result).__name__}: {result}")
-            else:
-                outputs.append(result)
+        failures = [(i, r) for i, r in enumerate(outputs_raw) if isinstance(r, BaseException)]
+        if failures:
+            idx, first = failures[0]
+            raise RuntimeError(
+                f"teacher logprobs failed for {len(failures)}/{len(outputs_raw)} samples in this batch; "
+                f"first was sample {idx}: {type(first).__name__}: {first}. "
+                "Refusing to substitute zero logprobs — that is log(1), maximal teacher "
+                "certainty, and it reinforces the failed trajectory."
+            ) from first
+        outputs = list(outputs_raw)
 
         # Pad the teacher logprobs and ids
         padded_teacher_ids = []
